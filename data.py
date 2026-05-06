@@ -19,45 +19,44 @@ with open(single_file_path, 'w', encoding='utf-8') as f:
     f.write(full_text)
 print(f"Saved complete text to {single_file_path}")
 
-# Now split by volumes (look for "VOLUME" markers)
+# Split by author/section instead
+# Split on common patterns
+sections = []
+current_section = []
+current_title = ""
+
 lines = full_text.split('\n')
-current_volume = None
-current_text = []
-volume_count = 0
 
 for line in lines:
-    # Check if this is a volume header
-    if 'VOLUME' in line.upper() and any(str(i) in line for i in range(1, 11)):
-        # Save previous volume if it exists
-        if current_volume and current_text:
-            filename = os.path.join(output_dir, f"volume_{current_volume:02d}.txt")
+    # Look for section headers (usually all caps, followed by content)
+    if line.strip() and len(line.strip()) > 5 and line.strip().isupper() and len(line.strip().split()) < 10:
+        # Save previous section
+        if current_section and len(current_section) > 50:  # Only save substantial sections
+            filename = os.path.join(output_dir, f"{current_title.replace(' ', '_').replace('/', '_')[:80]}.txt")
             with open(filename, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(current_text))
-            print(f"Saved volume {current_volume} ({len(current_text)} lines)")
-            volume_count += 1
+                f.write('\n'.join(current_section))
+            print(f"Saved: {current_title[:60]} ({len(current_section)} lines)")
         
-        # Start new volume
-        current_volume = int(''.join(filter(str.isdigit, line.split()[0:3])))
-        current_text = [line]
+        current_title = line.strip()
+        current_section = [line]
     else:
-        if current_volume is not None:
-            current_text.append(line)
+        if current_section or line.strip():
+            current_section.append(line)
 
-# Save final volume
-if current_volume and current_text:
-    filename = os.path.join(output_dir, f"volume_{current_volume:02d}.txt")
+# Save final section
+if current_section and len(current_section) > 50:
+    filename = os.path.join(output_dir, f"{current_title.replace(' ', '_').replace('/', '_')[:80]}.txt")
     with open(filename, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(current_text))
-    print(f"Saved volume {current_volume} ({len(current_text)} lines)")
-    volume_count += 1
+        f.write('\n'.join(current_section))
+    print(f"Saved: {current_title[:60]} ({len(current_section)} lines)")
 
 print(f"\n✓ Finished!")
-print(f"Total volumes extracted: {volume_count}")
 print(f"All files saved to {output_dir}")
 
 # List what we created
 print("\nFiles created:")
-for file in sorted(os.listdir(output_dir)):
+files = sorted(os.listdir(output_dir))
+for file in files:
     filepath = os.path.join(output_dir, file)
     size = os.path.getsize(filepath) / 1e6
     print(f"  - {file} ({size:.1f} MB)")
