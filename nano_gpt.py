@@ -6,9 +6,9 @@ import re
 import os
 
 # --- Hyperparameters for GPU Nano-GPT ---
-batch_size = 64       # How many independent sequences to process in parallel
+batch_size = 8       # How many independent sequences to process in parallel
 block_size = 512       # Maximum context length for predictions
-max_iters = 1000      # How many training steps to take
+max_iters = 10000      # How many training steps to take
 eval_interval = 200   # How often to print loss
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available

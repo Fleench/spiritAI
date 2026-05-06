@@ -9,12 +9,15 @@ import os
 OUTPUT_DIR = "/workspace/models"
 
 # --- Hyperparameters (MUST MATCH TRAINING SCRIPT) ---
-block_size = 64
-n_embd = 64
-n_head = 4
-n_layer = 2
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+batch_size = 8       # How many independent sequences to process in parallel
+block_size = 512       # Maximum context length for predictions
+max_iters = 10000      # How many training steps to take
+eval_interval = 200   # How often to print loss
+learning_rate = 1e-3
+device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
+n_embd = 512           # Embedding dimension
+n_head = 8            # Number of attention heads
+n_layer = 8           # Number of transformer blocks
 print(f"Using device: {device}")
 
 # --- Load Vocabulary ---
