@@ -12,7 +12,7 @@ def scrape_with_playwright(url, depth=0):
     """Scrape using Playwright to handle JavaScript rendering"""
     global downloaded_articles
     
-    if depth > 2:  # Limit recursion
+    if depth > 3:  # Limit recursion
         return
     
     if url in visited_urls:
@@ -31,12 +31,11 @@ def scrape_with_playwright(url, depth=0):
             page = browser.new_page()
             
             page.goto(url, wait_until='networkidle', timeout=30000)
-            time.sleep(2)  # Extra wait for dynamic content
+            time.sleep(2)
             
             # Get full page text
             text = page.content()
             
-            # Extract main content
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(text, 'html.parser')
             
@@ -46,8 +45,8 @@ def scrape_with_playwright(url, depth=0):
             
             content = soup.get_text(separator=' ', strip=True)
             
-            # If this is an article page (not just a category listing)
-            if len(content) > 1000 and '/category/ante-nicene/' not in url:
+            # Save if it's a book/article page (not a category listing)
+            if len(content) > 1000 and '/book/' in url:
                 filename = url.replace('https://', '').replace('/', '_').replace('.', '_')[:100] + '.txt'
                 filepath = f'/workspace/data/{filename}'
                 
@@ -64,32 +63,43 @@ def scrape_with_playwright(url, depth=0):
             for link in links:
                 try:
                     href = link.get_attribute('href')
-                    if href and 'churchwritings.com' in href:
-                        if href.startswith('/'):
-                            href = base_url + href
-                        
-                        href = href.split('#')[0]  # Remove fragments
-                        
-                        if href not in visited_urls and len(found_links) < 10:
-                            found_links.append(href)
+                    if not href:
+                        continue
+                    
+                    # Convert relative to absolute
+                    if href.startswith('/'):
+                        href = base_url + href
+                    
+                    # Only scrape churchwritings.com
+                    if 'churchwritings.com' not in href:
+                        continue
+                    
+                    # Remove fragments
+                    href = href.split('#')[0]
+                    
+                    # Only follow category and book links
+                    if ('/category/ante-nicene/' in href or '/book/' in href) and href not in visited_urls:
+                        found_links.append(href)
                 except:
                     pass
             
+            # Remove duplicates
+            found_links = list(set(found_links))
             print(f"{'  ' * depth}Found {len(found_links)} new links")
             
             browser.close()
             
             # Scrape found links
-            for link in found_links:
-                time.sleep(1)  # Be nice to server
+            for link in found_links[:20]:  # Limit to 20 per page
+                time.sleep(1)
                 scrape_with_playwright(link, depth + 1)
     
     except Exception as e:
         print(f"{'  ' * depth}✗ Error: {e}")
 
-# Start from the main Ante-Nicene category
-print("Starting Playwright scrape of Ante-Nicene writings...")
-print("This will take a while (loading JavaScript on each page)...\n")
+# Start from main Ante-Nicene category
+print("Starting scrape of Ante-Nicene writings...")
+print("This will take a while...\n")
 
 scrape_with_playwright(f"{base_url}/category/ante-nicene")
 
