@@ -5,13 +5,13 @@ import json
 import re
 import os
 
-# --- Hyperparameters for CPU Nano-GPT ---
+# --- Hyperparameters for GPU Nano-GPT ---
 batch_size = 16       # How many independent sequences to process in parallel
 block_size = 64       # Maximum context length for predictions
 max_iters = 200      # How many training steps to take
 eval_interval = 200   # How often to print loss
 learning_rate = 1e-3
-device = 'gpu'        # Training on CPU
+device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
 n_embd = 64           # Embedding dimension
 n_head = 4            # Number of attention heads
 n_layer = 2           # Number of transformer blocks
@@ -19,13 +19,23 @@ n_layer = 2           # Number of transformer blocks
 
 import glob
 
-print("1. Loading and Tokenizing Dataset...")
+# Setup directories
+DATA_DIR = "/workspace/data"
+OUTPUT_DIR = "/workspace/models"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"Using device: {device}")
+print(f"Data directory: {DATA_DIR}")
+print(f"Output directory: {OUTPUT_DIR}")
+
+print("\n1. Loading and Tokenizing Dataset...")
 raw_text = []
 
 # Load original JSON if it exists
-if os.path.exists("data/CPDV.json"):
-    print(" - Loading data/CPDV.json")
-    with open("data/CPDV.json", "r", encoding="utf-8") as f:
+bible_path = os.path.join(DATA_DIR, "CPDV.json")
+if os.path.exists(bible_path):
+    print(f" - Loading {bible_path}")
+    with open(bible_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     for book in data.get("books", []):
         for chapter in book.get("chapters", []):
@@ -33,13 +43,13 @@ if os.path.exists("data/CPDV.json"):
                 raw_text.append(verse["text"])
 
 # Load all .txt and .md files
-for filepath in glob.glob("data/*.txt") + glob.glob("data/*.md"):
+for filepath in glob.glob(os.path.join(DATA_DIR, "*.txt")) + glob.glob(os.path.join(DATA_DIR, "*.md")):
     print(f" - Loading {filepath}")
     with open(filepath, "r", encoding="utf-8") as f:
         raw_text.append(f.read())
 
 if not raw_text:
-    print("Error: No text data found in the data/ directory.")
+    print(f"Error: No text data found in {DATA_DIR}")
     exit(1)
 
 full_text = " ".join(raw_text)
@@ -69,7 +79,7 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    return x, y
+    return x.to(device), y.to(device)
 
 @torch.no_grad()
 def estimate_loss(model):
@@ -187,7 +197,7 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 # --- Training ---
-print("3. Initializing Nano-GPT Model...")
+print("\n3. Initializing Nano-GPT Model...")
 model = GPTLanguageModel()
 m = model.to(device)
 
@@ -197,7 +207,7 @@ print(f"Model Parameters: {n_params / 1e6:.2f} Million")
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-print(f"4. Starting Training for {max_iters} iterations on CPU...")
+print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
 for iter in range(max_iters):
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(model)
@@ -212,16 +222,18 @@ for iter in range(max_iters):
 print("\n--- Training Complete! Saving Model ---")
 
 # Save the model weights
-torch.save(m.state_dict(), 'nano_gpt_model.pt')
+model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
+torch.save(m.state_dict(), model_path)
+print(f"Model saved to '{model_path}'")
 
 # Save the vocabulary so the chat app knows how to convert words to numbers
+vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
 vocab_data = {
     'stoi': stoi,
     'itos': itos
 }
-with open('vocab.json', 'w', encoding='utf-8') as f:
+with open(vocab_path, 'w', encoding='utf-8') as f:
     json.dump(vocab_data, f)
+print(f"Vocabulary saved to '{vocab_path}'")
 
-print("Model saved to 'nano_gpt_model.pt'")
-print("Vocabulary saved to 'vocab.json'")
-print("You can now run the chat app!")
+print("\nYou can now run the chat app!")

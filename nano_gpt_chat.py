@@ -3,21 +3,29 @@ import torch.nn as nn
 from torch.nn import functional as F
 import json
 import re
+import os
+
+# Setup directories
+OUTPUT_DIR = "/workspace/models"
 
 # --- Hyperparameters (MUST MATCH TRAINING SCRIPT) ---
 block_size = 64
 n_embd = 64
 n_head = 4
 n_layer = 2
-device = 'gpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+print(f"Using device: {device}")
 
 # --- Load Vocabulary ---
 print("Loading vocabulary...")
+vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
 try:
-    with open('vocab.json', 'r', encoding='utf-8') as f:
+    with open(vocab_path, 'r', encoding='utf-8') as f:
         vocab_data = json.load(f)
 except FileNotFoundError:
-    print("Error: vocab.json not found. You must run trainer/nano_gpt.py first!")
+    print(f"Error: vocab.json not found at {vocab_path}")
+    print(f"You must run nano_gpt.py first!")
     exit(1)
 
 stoi = vocab_data['stoi']
@@ -115,10 +123,12 @@ class GPTLanguageModel(nn.Module):
 # --- Load Model Weights ---
 print("Loading model weights...")
 model = GPTLanguageModel()
+model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
 try:
-    model.load_state_dict(torch.load('nano_gpt_model.pt', map_location=device, weights_only=True))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
 except FileNotFoundError:
-    print("Error: nano_gpt_model.pt not found. You must run trainer/nano_gpt.py first!")
+    print(f"Error: nano_gpt_model.pt not found at {model_path}")
+    print("You must run nano_gpt.py first!")
     exit(1)
 
 m = model.to(device)
@@ -131,6 +141,7 @@ print("-" * 40)
 while True:
     user_input = input("\nYou: ")
     if user_input.lower() in ['exit', 'quit']:
+        print("Goodbye!")
         break
     if not user_input.strip():
         continue
@@ -138,13 +149,14 @@ while True:
     # Encode user input using our vocabulary
     context_idx = encode(user_input)
     if not context_idx:
-        print("SpiritAI: [I didn't recognize any of those words.]")
+        print("AI: [I didn't recognize any of those words.]")
         continue
         
     x = torch.tensor([context_idx], dtype=torch.long, device=device)
     
-    # Generate 50 new words
-    y = m.generate(x, max_new_tokens=50)
+    # Generate 50 new tokens
+    with torch.no_grad():
+        y = m.generate(x, max_new_tokens=50)
     
     # The output includes our prompt, so we decode the whole thing
     out_text = decode(y[0].tolist())
@@ -152,4 +164,4 @@ while True:
     # Basic formatting to remove spaces before punctuation
     out_text = re.sub(r'\s+([.,;:!?])', r'\1', out_text)
     
-    print(f"SpiritAI: {out_text}")
+    print(f"AI: {out_text}")
