@@ -4,24 +4,25 @@ from torch.nn import functional as F
 import json
 import re
 import os
-
-# --- Hyperparameters for GPU Nano-GPT ---
-batch_size = 8       # How many independent sequences to process in parallel
-block_size = 512       # Maximum context length for predictions
-max_iters = 10000      # How many training steps to take
-eval_interval = 200   # How often to print loss
-learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
-n_embd = 512           # Embedding dimension
-n_head = 8            # Number of attention heads
-n_layer = 8           # Number of transformer blocks
-# ----------------------------------------
-
 import glob
+from dotenv import load_dotenv
 
-# Setup directories
-DATA_DIR = "/workspace/data"
-OUTPUT_DIR = "/workspace/models"
+# Load configuration from .env file
+load_dotenv()
+
+# Get settings from environment variables (with defaults if not set)
+DATA_DIR = os.getenv('DATA_DIR', '/workspace/data')
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
+batch_size = int(os.getenv('BATCH_SIZE', '32'))
+block_size = int(os.getenv('BLOCK_SIZE', '256'))
+max_iters = int(os.getenv('MAX_ITERS', '50000'))
+eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
+learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
+n_embd = int(os.getenv('N_EMBD', '256'))
+n_head = int(os.getenv('N_HEAD', '8'))
+n_layer = int(os.getenv('N_LAYER', '6'))
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 print(f"Using device: {device}")
