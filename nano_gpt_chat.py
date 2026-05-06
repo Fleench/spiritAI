@@ -4,20 +4,20 @@ from torch.nn import functional as F
 import json
 import re
 import os
+from dotenv import load_dotenv
 
-# Setup directories
-OUTPUT_DIR = "/workspace/models"
+# Load configuration from .env file
+load_dotenv()
 
-# --- Hyperparameters (MUST MATCH TRAINING SCRIPT) ---
-batch_size = 8       # How many independent sequences to process in parallel
-block_size = 512       # Maximum context length for predictions
-max_iters = 10000      # How many training steps to take
-eval_interval = 200   # How often to print loss
-learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
-n_embd = 512           # Embedding dimension
-n_head = 8            # Number of attention heads
-n_layer = 8           # Number of transformer blocks
+# Get settings from environment variables (must match training script)
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
+block_size = int(os.getenv('BLOCK_SIZE', '256'))
+n_embd = int(os.getenv('N_EMBD', '256'))
+n_head = int(os.getenv('N_HEAD', '8'))
+n_layer = int(os.getenv('N_LAYER', '6'))
+max_new_tokens = int(os.getenv('MAX_NEW_TOKENS', '100'))
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 print(f"Using device: {device}")
 
 # --- Load Vocabulary ---
@@ -157,9 +157,9 @@ while True:
         
     x = torch.tensor([context_idx], dtype=torch.long, device=device)
     
-    # Generate 50 new tokens
+    # Generate tokens (amount from config)
     with torch.no_grad():
-        y = m.generate(x, max_new_tokens=50)
+        y = m.generate(x, max_new_tokens=max_new_tokens)
     
     # The output includes our prompt, so we decode the whole thing
     out_text = decode(y[0].tolist())
