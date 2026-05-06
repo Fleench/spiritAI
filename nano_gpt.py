@@ -1,0 +1,227 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import json
+import re
+import os
+
+# --- Hyperparameters for CPU Nano-GPT ---
+batch_size = 16       # How many independent sequences to process in parallel
+block_size = 64       # Maximum context length for predictions
+max_iters = 200      # How many training steps to take
+eval_interval = 200   # How often to print loss
+learning_rate = 1e-3
+device = 'cpu'        # Training on CPU
+n_embd = 64           # Embedding dimension
+n_head = 4            # Number of attention heads
+n_layer = 2           # Number of transformer blocks
+# ----------------------------------------
+
+import glob
+
+print("1. Loading and Tokenizing Dataset...")
+raw_text = []
+
+# Load original JSON if it exists
+if os.path.exists("data/CPDV.json"):
+    print(" - Loading data/CPDV.json")
+    with open("data/CPDV.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for book in data.get("books", []):
+        for chapter in book.get("chapters", []):
+            for verse in chapter.get("verses", []):
+                raw_text.append(verse["text"])
+
+# Load all .txt and .md files
+for filepath in glob.glob("data/*.txt") + glob.glob("data/*.md"):
+    print(f" - Loading {filepath}")
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw_text.append(f.read())
+
+if not raw_text:
+    print("Error: No text data found in the data/ directory.")
+    exit(1)
+
+full_text = " ".join(raw_text)
+
+# Basic word/punctuation tokenizer
+tokens = re.findall(r"\w+|[^\w\s]", full_text)
+vocab = sorted(list(set(tokens)))
+vocab_size = len(vocab)
+print(f"Total tokens in dataset: {len(tokens)}")
+print(f"Vocabulary size: {vocab_size}")
+
+# Create mappings from word to integer and integer to word
+stoi = {w: i for i, w in enumerate(vocab)}
+itos = {i: w for i, w in enumerate(vocab)}
+encode = lambda s: [stoi[w] for w in re.findall(r"\w+|[^\w\s]", s) if w in stoi]
+decode = lambda l: " ".join([itos[i] for i in l])
+
+# Train/Test Split
+print("2. Converting to Tensors...")
+data_tensor = torch.tensor([stoi[w] for w in tokens], dtype=torch.long)
+n = int(0.9 * len(data_tensor))
+train_data = data_tensor[:n]
+val_data = data_tensor[n:]
+
+def get_batch(split):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    return x, y
+
+@torch.no_grad()
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(50)
+        for k in range(50):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+# --- GPT Architecture ---
+
+class Head(nn.Module):
+    """ One head of self-attention """
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        
+        # Compute attention scores ("affinities")
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        
+        v = self.value(x)
+        out = wei @ v
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+class GPTLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx) # (B, T, C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
+            logits = logits[:, -1, :] # focuses only on the last time step
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+# --- Training ---
+print("3. Initializing Nano-GPT Model...")
+model = GPTLanguageModel()
+m = model.to(device)
+
+# Print number of parameters
+n_params = sum(p.numel() for p in m.parameters())
+print(f"Model Parameters: {n_params / 1e6:.2f} Million")
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+print(f"4. Starting Training for {max_iters} iterations on CPU...")
+for iter in range(max_iters):
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        losses = estimate_loss(model)
+        print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+    xb, yb = get_batch('train')
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+print("\n--- Training Complete! Saving Model ---")
+
+# Save the model weights
+torch.save(m.state_dict(), 'nano_gpt_model.pt')
+
+# Save the vocabulary so the chat app knows how to convert words to numbers
+vocab_data = {
+    'stoi': stoi,
+    'itos': itos
+}
+with open('vocab.json', 'w', encoding='utf-8') as f:
+    json.dump(vocab_data, f)
+
+print("Model saved to 'nano_gpt_model.pt'")
+print("Vocabulary saved to 'vocab.json'")
+print("You can now run the chat app!")
