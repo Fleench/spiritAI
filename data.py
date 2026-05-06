@@ -1,128 +1,63 @@
-from playwright.sync_api import sync_playwright
+import requests
 import os
-import time
 
-base_url = "https://churchwritings.com"
-os.makedirs('/workspace/data', exist_ok=True)
+# Download the text file
+url = "https://archive.org/stream/AnteNiceneFathersCompleteVolumesIToIX_201407/Ante-nicene%20fathers%20-%20complete%20volumes%20I%20to%20IX_djvu.txt"
+output_dir = "/workspace/data"
+os.makedirs(output_dir, exist_ok=True)
 
-visited_urls = set()
-downloaded_articles = 0
-browser = None
-context = None
+print("Downloading complete Ante-Nicene Fathers text...")
+response = requests.get(url, timeout=30)
+response.raise_for_status()
 
-def init_browser():
-    """Initialize browser once"""
-    global browser, context
-    p = sync_playwright().start()
-    browser = p.chromium.launch(headless=True)
-    context = browser.new_context()
+full_text = response.text
+print(f"Downloaded {len(full_text):,} characters")
 
-def close_browser():
-    """Close browser"""
-    global browser, context
-    if context:
-        context.close()
-    if browser:
-        browser.close()
+# Save as single file first
+single_file_path = os.path.join(output_dir, "ante_nicene_complete.txt")
+with open(single_file_path, 'w', encoding='utf-8') as f:
+    f.write(full_text)
+print(f"Saved complete text to {single_file_path}")
 
-def scrape_with_playwright(url, depth=0):
-    """Scrape using shared browser instance"""
-    global downloaded_articles, context
-    
-    if depth > 3:
-        return
-    
-    if url in visited_urls:
-        return
-    
-    visited_urls.add(url)
-    
-    if 'churchwritings.com' not in url:
-        return
-    
-    print(f"{'  ' * depth}Fetching: {url}")
-    
-    try:
-        page = context.new_page()
-        
-        page.goto(url, wait_until='networkidle', timeout=30000)
-        time.sleep(2)
-        
-        # Get full page text
-        text = page.content()
-        
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(text, 'html.parser')
-        
-        # Remove script and style elements
-        for script in soup(['script', 'style']):
-            script.decompose()
-        
-        content = soup.get_text(separator=' ', strip=True)
-        
-        # Save if it's a book/article page
-        if len(content) > 1000 and '/book/' in url:
-            filename = url.replace('https://', '').replace('/', '_').replace('.', '_')[:100] + '.txt'
-            filepath = f'/workspace/data/{filename}'
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            print(f"{'  ' * depth}✓ SAVED: {filename} ({len(content)} chars)")
-            downloaded_articles += 1
-        
-        # Find all links on page
-        links = page.locator('a[href]').all()
-        found_links = []
-        
-        for link in links:
-            try:
-                href = link.get_attribute('href')
-                if not href:
-                    continue
-                
-                # Convert relative to absolute
-                if href.startswith('/'):
-                    href = base_url + href
-                
-                # Only scrape churchwritings.com
-                if 'churchwritings.com' not in href:
-                    continue
-                
-                # Remove fragments
-                href = href.split('#')[0]
-                
-                # Only follow category and book links
-                if ('/category/ante-nicene/' in href or '/book/' in href) and href not in visited_urls:
-                    found_links.append(href)
-            except:
-                pass
-        
-        # Remove duplicates
-        found_links = list(set(found_links))
-        print(f"{'  ' * depth}Found {len(found_links)} new links")
-        
-        page.close()
-        
-        # Scrape found links
-        for link in found_links[:20]:
-            time.sleep(1)
-            scrape_with_playwright(link, depth + 1)
-    
-    except Exception as e:
-        print(f"{'  ' * depth}✗ Error: {e}")
+# Now split by volumes (look for "VOLUME" markers)
+lines = full_text.split('\n')
+current_volume = None
+current_text = []
+volume_count = 0
 
-# Start scraping
-print("Starting scrape of Ante-Nicene writings...")
-print("This will take a while...\n")
+for line in lines:
+    # Check if this is a volume header
+    if 'VOLUME' in line.upper() and any(str(i) in line for i in range(1, 11)):
+        # Save previous volume if it exists
+        if current_volume and current_text:
+            filename = os.path.join(output_dir, f"volume_{current_volume:02d}.txt")
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(current_text))
+            print(f"Saved volume {current_volume} ({len(current_text)} lines)")
+            volume_count += 1
+        
+        # Start new volume
+        current_volume = int(''.join(filter(str.isdigit, line.split()[0:3])))
+        current_text = [line]
+    else:
+        if current_volume is not None:
+            current_text.append(line)
 
-init_browser()
-
-try:
-    scrape_with_playwright(f"{base_url}/category/ante-nicene")
-finally:
-    close_browser()
+# Save final volume
+if current_volume and current_text:
+    filename = os.path.join(output_dir, f"volume_{current_volume:02d}.txt")
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(current_text))
+    print(f"Saved volume {current_volume} ({len(current_text)} lines)")
+    volume_count += 1
 
 print(f"\n✓ Finished!")
-print(f"Downloaded {downloaded_articles} articles")
-print(f"Total URLs visited: {len(visited_urls)}")
+print(f"Total volumes extracted: {volume_count}")
+print(f"All files saved to {output_dir}")
+
+# List what we created
+print("\nFiles created:")
+for file in sorted(os.listdir(output_dir)):
+    filepath = os.path.join(output_dir, file)
+    size = os.path.getsize(filepath) / 1e6
+    print(f"  - {file} ({size:.1f} MB)")
