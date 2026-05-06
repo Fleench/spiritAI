@@ -1,22 +1,22 @@
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-base_url = "https://churchwritings.com"
-url = f"{base_url}/category/ante-nicene/barnabas"
-
-response = requests.get(url)
-soup = BeautifulSoup(response.content, 'html.parser')
-
-# Print the raw HTML structure
-print(soup.prettify()[:2000])  # First 2000 chars of HTML
-
-# Also check for specific content markers
-print("\n\n=== Looking for content ===")
-print(f"Title: {soup.title}")
-print(f"H1: {soup.find('h1')}")
-print(f"H2: {soup.find('h2')}")
-
-# Get all text
-text = soup.get_text()
-print(f"\nTotal text on page: {len(text)} chars")
-print(f"First 500 chars:\n{text[:500]}")
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    
+    page.goto("https://churchwritings.com/category/ante-nicene", wait_until='networkidle', timeout=30000)
+    
+    # Get all links
+    links = page.locator('a').all()
+    print(f"Total links on page: {len(links)}\n")
+    
+    # Print first 20 links
+    for i, link in enumerate(links[:20]):
+        try:
+            href = link.get_attribute('href')
+            text = link.text_content()
+            print(f"{i}: {href} -> {text}")
+        except:
+            pass
+    
+    browser.close()
