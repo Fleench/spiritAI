@@ -3,6 +3,7 @@ import os
 
 # Download the text file
 url = "https://archive.org/stream/AnteNiceneFathersCompleteVolumesIToIX_201407/Ante-nicene%20fathers%20-%20complete%20volumes%20I%20to%20IX_djvu.txt"
+url = "https://archive.org/stream/catechismofthecatholicchurch/Catechism%20of%20the%20Catholic%20Church%20-%20USCCB_djvu.txt"
 output_dir = "/workspace/data"
 os.makedirs(output_dir, exist_ok=True)
 

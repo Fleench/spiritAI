@@ -229,6 +229,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler('cuda') 
 
 print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
+model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
 for iter in range(max_iters):
     # Free cache frequently to keep memory usage flat
     if iter % 250 == 0:
@@ -237,7 +238,7 @@ for iter in range(max_iters):
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(model)
         print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
+        torch.save(model.state_dict(), model_path)
     xb, yb = get_batch('train')
     
     with torch.amp.autocast('cuda'):
