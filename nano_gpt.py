@@ -8,7 +8,7 @@ import os
 import glob
 from dotenv import load_dotenv
 
-# Set memory management flags for PyTorch to avoid fragmentation
+# CRITICAL: Prevent memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Clear CUDA cache immediately to free up memory from previous crashes
@@ -21,14 +21,16 @@ load_dotenv()
 # Get settings from environment variables (with defaults if not set)
 DATA_DIR = os.getenv('DATA_DIR', '/workspace/data')
 OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
-batch_size = int(os.getenv('BATCH_SIZE', '16'))
+
+# LOWERED FOR STABILITY: 5090 is powerful but we must avoid the 30GB crash
+batch_size = int(os.getenv('BATCH_SIZE', '8'))  
 block_size = int(os.getenv('BLOCK_SIZE', '256'))
 max_iters = int(os.getenv('MAX_ITERS', '10000'))
 eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
 learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
 
-# Adjusting architecture slightly for safety: 512 is still high quality
-n_embd = int(os.getenv('N_EMBD', '512')) 
+# ARCHITECTURE ADJUSTMENT: 384 is a "sweet spot" for 12 layers on mid-sized VRAM
+n_embd = int(os.getenv('N_EMBD', '384')) 
 n_head = int(os.getenv('N_HEAD', '8'))
 n_layer = int(os.getenv('N_LAYER', '12'))
 
@@ -120,8 +122,8 @@ class Head(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)   # (B, T, head_size)
-        q = self.query(x) # (B, T, head_size)
+        k = self.key(x)   
+        q = self.query(x) 
         
         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
@@ -164,7 +166,6 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        # Skip connections
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
@@ -184,10 +185,10 @@ class GPTLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
         x = tok_emb + pos_emb
         
-        # Applying Gradient Checkpointing to save massive VRAM
+        # Applying Gradient Checkpointing to every block
         for block in self.blocks:
             if self.training:
-                # Use dummy inputs to ensure it works correctly with checkpoint
+                # use_reentrant=False is the modern way to handle this
                 x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
@@ -229,8 +230,8 @@ scaler = torch.amp.GradScaler('cuda')
 
 print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
 for iter in range(max_iters):
-    # Aggressive memory cleanup
-    if iter % 100 == 0:
+    # Free cache frequently to keep memory usage flat
+    if iter % 250 == 0:
         torch.cuda.empty_cache()
 
     if iter % eval_interval == 0 or iter == max_iters - 1:
