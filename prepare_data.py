@@ -134,6 +134,7 @@ def resolve_input_paths(input_args: list[str] | None, output_dir: Path) -> list[
 
     preferred_names = (
         "clean.txt",
+        "chat_corpus.txt",
         "theology_sources_combined.txt",
         "theology.txt",
     )
