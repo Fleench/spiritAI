@@ -1,7 +1,12 @@
 """Sanitize theological text and tokenize it into train.bin/val.bin.
 
 Usage:
+    python prepare_data.py
     python prepare_data.py --input /workspace/raw_data/theology.txt --output-dir /workspace/data
+
+If --input is omitted, the script auto-detects cleaned .txt/.md files in
+the output directory (for example files produced by sanatize.py) and combines
+them for tokenization.
 
 The output directory receives:
     clean.txt      deduplicated, normalized text
@@ -23,6 +28,8 @@ import re
 import unicodedata
 
 from array import array
+
+DEFAULT_RAW_DATA_DIR = Path(os.getenv("RAW_DATA_DIR", "/workspace/raw_data"))
 
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 SPLIT_WORD_FIXES = {
@@ -114,19 +121,82 @@ def encode(tokens: list[str], stoi: dict[str, int]) -> array:
     return ids
 
 
+def resolve_input_paths(input_args: list[str] | None, output_dir: Path) -> list[Path]:
+    """Resolve explicit input files or auto-detect cleaned corpus files."""
+    if input_args:
+        return [Path(path) for path in input_args]
+
+    candidate_dirs = []
+    for directory in (output_dir, Path("data"), DEFAULT_RAW_DATA_DIR):
+        if directory not in candidate_dirs:
+            candidate_dirs.append(directory)
+
+    preferred_names = (
+        "clean.txt",
+        "theology_sources_combined.txt",
+        "theology.txt",
+    )
+    for directory in candidate_dirs:
+        for name in preferred_names:
+            path = directory / name
+            if path.exists():
+                return [path]
+
+    for directory in candidate_dirs:
+        if not directory.exists():
+            continue
+        paths = sorted(
+            path
+            for pattern in ("*.txt", "*.md")
+            for path in directory.glob(pattern)
+            if path.name not in {"auto_corpus.txt"}
+        )
+        if paths:
+            return paths
+
+    searched = ", ".join(str(directory) for directory in candidate_dirs)
+    raise FileNotFoundError(
+        "No input corpus found. Run data.py and/or sanatize.py first, or pass "
+        f"--input /path/to/corpus.txt. Searched: {searched}"
+    )
+
+
+def read_corpus(input_paths: list[Path]) -> str:
+    """Read one or more UTF-8 text/markdown files into a single corpus."""
+    missing = [str(path) for path in input_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Input file(s) not found: {', '.join(missing)}")
+
+    corpus_parts: list[str] = []
+    for path in input_paths:
+        corpus_parts.append(f"\n\n===== {path} =====\n\n{path.read_text(encoding='utf-8')}")
+    return "".join(corpus_parts).strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare sanitized token bins for Nano-GPT training.")
-    parser.add_argument("--input", required=True, help="Raw UTF-8 text file to sanitize and tokenize.")
+    parser.add_argument(
+        "--input",
+        nargs="*",
+        help=(
+            "Optional raw UTF-8 text/markdown file(s) to sanitize and tokenize. "
+            "If omitted, cleaned corpus files are auto-detected."
+        ),
+    )
     parser.add_argument("--output-dir", default=os.getenv("DATA_DIR", "/workspace/data"))
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--min-freq", type=int, default=1, help="Minimum token frequency kept in vocab.")
     args = parser.parse_args()
 
-    input_path = Path(args.input)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    input_paths = resolve_input_paths(args.input, output_dir)
 
-    raw_text = input_path.read_text(encoding="utf-8")
+    print("Preparing corpus from:")
+    for path in input_paths:
+        print(f"  - {path}")
+
+    raw_text = read_corpus(input_paths)
     clean_text = sanitize_text(raw_text)
     clean_text, duplicates_removed = deduplicate_paragraphs(clean_text)
     (output_dir / "clean.txt").write_text(clean_text, encoding="utf-8")
@@ -150,7 +220,7 @@ def main() -> None:
     with open(output_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(
             {
-                "source": str(input_path),
+                "source": [str(path) for path in input_paths],
                 "raw_chars": len(raw_text),
                 "clean_chars": len(clean_text),
                 "duplicates_removed": duplicates_removed,

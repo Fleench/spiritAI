@@ -48,7 +48,8 @@ def process_files() -> None:
                     verse["text"] = clean_text(verse["text"])
         (CLEAN_DATA_DIR / "CPDV.json").write_text(json.dumps(data, indent=4), encoding="utf-8")
 
-    print("Sanitization complete. Use prepare_data.py for train.bin/val.bin generation.")
+    print("Sanitization complete. Next: python prepare_data.py")
+    print("prepare_data.py will auto-detect the cleaned files in the data directory.")
 
 
 if __name__ == "__main__":
