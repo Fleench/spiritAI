@@ -14,7 +14,9 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import time
+from typing import Any
 
 from dotenv import load_dotenv
 import shutil
@@ -43,6 +45,10 @@ beta2 = float(os.getenv("BETA2", "0.95"))
 grad_clip = float(os.getenv("GRAD_CLIP", "1.0"))
 compile_model = os.getenv("COMPILE", "true").lower() in {"1", "true", "yes"}
 always_save_checkpoint = os.getenv("ALWAYS_SAVE_CHECKPOINT", "true").lower() in {"1", "true", "yes"}
+checkpoint_interval_seconds = int(os.getenv("CHECKPOINT_INTERVAL_SECONDS", "900"))
+max_training_hours = float(os.getenv("MAX_TRAINING_HOURS", "0"))
+min_free_disk_gb = float(os.getenv("MIN_FREE_DISK_GB", "2"))
+loss_abort_threshold = float(os.getenv("LOSS_ABORT_THRESHOLD", "1e4"))
 seed = int(os.getenv("SEED", "1337"))
 
 torch.manual_seed(seed)
@@ -80,14 +86,25 @@ config.block_size = block_size
 config.to_json(OUTPUT_DIR / "config.json")
 shutil.copyfile(vocab_path, OUTPUT_DIR / "vocab.json")
 
-print(f"Using device: {device} ({ptdtype})")
-print(f"Data directory: {DATA_DIR}")
-print(f"Output directory: {OUTPUT_DIR}")
-print(f"Tokens: train={len(train_data):,}, val={len(val_data):,}, vocab={vocab_size:,}")
-print(
+def log(message: str) -> None:
+    """Print immediately so unattended logs show progress in real time."""
+    print(message, flush=True)
+
+
+log(f"Using device: {device} ({ptdtype})")
+log(f"Data directory: {DATA_DIR}")
+log(f"Output directory: {OUTPUT_DIR}")
+log(f"Tokens: train={len(train_data):,}, val={len(val_data):,}, vocab={vocab_size:,}")
+log(
     "Config: "
     f"layers={config.n_layer}, heads={config.n_head}, embd={config.n_embd}, "
     f"block={config.block_size}, dropout={config.dropout}, batch={batch_size}"
+)
+log(
+    "Run safety: "
+    f"checkpoint_interval={checkpoint_interval_seconds}s, "
+    f"max_training_hours={max_training_hours or 'unlimited'}, "
+    f"min_free_disk_gb={min_free_disk_gb}"
 )
 
 
@@ -133,7 +150,7 @@ def get_lr(iter_num: int) -> float:
 model = GPTLanguageModel(config).to(device)
 raw_model = model
 n_params = sum(p.numel() for p in model.parameters())
-print(f"Model parameters: {n_params / 1e6:.2f}M")
+log(f"Model parameters: {n_params / 1e6:.2f}M")
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 scaler = torch.amp.GradScaler(enabled=(device_type == "cuda" and ptdtype == torch.float16))
 
@@ -143,68 +160,141 @@ best_val_loss = float("inf")
 start_iter = 0
 
 if checkpoint_path.exists() and os.getenv("RESUME", "true").lower() in {"1", "true", "yes"}:
-    print(f"Loading checkpoint from {checkpoint_path}")
+    log(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     raw_model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     start_iter = int(checkpoint.get("iter", -1)) + 1
     best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
-    print(f"Resuming from iteration {start_iter}; best val loss {best_val_loss:.4f}")
+    if "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+    if device_type == "cuda" and "cuda_rng_state_all" in checkpoint:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+    log(f"Resuming from iteration {start_iter}; best val loss {best_val_loss:.4f}")
 
 if compile_model and device_type == "cuda":
-    print("Compiling model with torch.compile...")
+    log("Compiling model with torch.compile...")
     model = torch.compile(model)
 
-print(f"Starting training for {max_iters:,} iterations")
-t0 = time.time()
-for iter_num in range(start_iter, max_iters):
-    lr = get_lr(iter_num)
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+def atomic_torch_save(obj: Any, path: Path) -> None:
+    """Write checkpoints atomically to avoid corrupting resumes after interruption."""
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
-    if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-        losses = estimate_loss(raw_model)
-        elapsed_hours = (time.time() - t0) / 3600
-        print(
-            f"step {iter_num:6d}: train {losses['train']:.4f}, val {losses['val']:.4f}, "
-            f"lr {lr:.2e}, elapsed {elapsed_hours:.2f}h"
+
+def free_disk_gb(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    return usage.free / (1024**3)
+
+
+def ensure_enough_disk() -> None:
+    free_gb = free_disk_gb(OUTPUT_DIR)
+    if free_gb < min_free_disk_gb:
+        raise RuntimeError(
+            f"Only {free_gb:.2f}GB free in {OUTPUT_DIR}; "
+            f"need at least {min_free_disk_gb:.2f}GB for safe checkpointing."
         )
-        if losses["val"] < best_val_loss or always_save_checkpoint:
-            best_val_loss = min(best_val_loss, losses["val"])
-            checkpoint = {
-                "iter": iter_num,
-                "model_state_dict": raw_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_loss": best_val_loss,
-                "config": config.__dict__,
-            }
-            torch.save(checkpoint, checkpoint_path)
-            torch.save(raw_model.state_dict(), model_path)
-            config.to_json(OUTPUT_DIR / "config.json")
-            print(f"saved checkpoint; best val loss {best_val_loss:.4f}")
 
-    xb, yb = get_batch("train")
-    with ctx:
-        _, loss = model(xb, yb)
-    assert loss is not None
-    optimizer.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
-    if grad_clip > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
-    scaler.step(optimizer)
-    scaler.update()
 
-print("Training complete; saving final model")
-torch.save(raw_model.state_dict(), model_path)
-torch.save(
-    {
-        "iter": max_iters - 1,
+def build_checkpoint(iter_num: int) -> dict[str, Any]:
+    checkpoint: dict[str, Any] = {
+        "iter": iter_num,
         "model_state_dict": raw_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
         "best_val_loss": best_val_loss,
         "config": config.__dict__,
-    },
-    checkpoint_path,
-)
-config.to_json(OUTPUT_DIR / "config.json")
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if device_type == "cuda":
+        checkpoint["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return checkpoint
+
+
+def save_training_state(iter_num: int, reason: str) -> None:
+    ensure_enough_disk()
+    atomic_torch_save(build_checkpoint(iter_num), checkpoint_path)
+    atomic_torch_save(raw_model.state_dict(), model_path)
+    config.to_json(OUTPUT_DIR / "config.json")
+    log(f"saved checkpoint at step {iter_num} ({reason}); best val loss {best_val_loss:.4f}")
+
+
+stop_requested = False
+
+
+def request_stop(signum: int, _frame: Any) -> None:
+    global stop_requested
+    stop_requested = True
+    log(f"Received signal {signum}; will checkpoint and stop after this iteration.")
+
+
+for handled_signal in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, request_stop)
+
+
+log(f"Starting training for {max_iters:,} iterations")
+t0 = time.time()
+last_checkpoint_time = t0
+last_completed_iter = start_iter - 1
+try:
+    for iter_num in range(start_iter, max_iters):
+        lr = get_lr(iter_num)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+            losses = estimate_loss(raw_model)
+            elapsed_hours = (time.time() - t0) / 3600
+            log(
+                f"step {iter_num:6d}: train {losses['train']:.4f}, val {losses['val']:.4f}, "
+                f"lr {lr:.2e}, elapsed {elapsed_hours:.2f}h"
+            )
+            if losses["val"] < best_val_loss or always_save_checkpoint:
+                best_val_loss = min(best_val_loss, losses["val"])
+                save_training_state(iter_num, "evaluation")
+                last_checkpoint_time = time.time()
+
+        xb, yb = get_batch("train")
+        with ctx:
+            _, loss = model(xb, yb)
+        if loss is None or not torch.isfinite(loss).item() or loss.item() > loss_abort_threshold:
+            bad_loss = float("nan") if loss is None else loss.item()
+            save_training_state(max(iter_num - 1, start_iter), f"unsafe loss {bad_loss}")
+            raise RuntimeError(f"Unsafe training loss detected at step {iter_num}: {bad_loss}")
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        last_completed_iter = iter_num
+
+        now = time.time()
+        if checkpoint_interval_seconds > 0 and now - last_checkpoint_time >= checkpoint_interval_seconds:
+            save_training_state(iter_num, "timed checkpoint")
+            last_checkpoint_time = now
+
+        if max_training_hours > 0 and (now - t0) / 3600 >= max_training_hours:
+            save_training_state(iter_num, "max training hours reached")
+            log(f"Reached MAX_TRAINING_HOURS={max_training_hours}; stopping cleanly.")
+            break
+
+        if stop_requested:
+            save_training_state(iter_num, "stop requested")
+            log("Stopped cleanly after checkpoint.")
+            break
+except Exception:
+    if last_completed_iter >= start_iter:
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+        save_training_state(last_completed_iter, "exception recovery")
+    raise
+else:
+    final_iter = last_completed_iter if last_completed_iter >= start_iter else max_iters - 1
+    log("Training complete; saving final model")
+    save_training_state(final_iter, "final")
