@@ -88,7 +88,7 @@ while True:
     if not user_input:
         continue
 
-    prompt = f"Question: {user_input}\nAnswer:"
+    prompt = f"{user_input}"
     context_idx = encode(prompt)
     if not context_idx:
         print("AI: [No recognizable tokens in prompt.]")
