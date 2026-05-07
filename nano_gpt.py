@@ -25,7 +25,7 @@ OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
 # LOWERED FOR STABILITY: 5090 is powerful but we must avoid the 30GB crash
 batch_size = int(os.getenv('BATCH_SIZE', '8'))  
 block_size = int(os.getenv('BLOCK_SIZE', '256'))
-max_iters = int(os.getenv('MAX_ITERS', '10000'))
+max_iters = int(os.getenv('MAX_ITERS', '100000'))
 eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
 learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
 
@@ -79,14 +79,18 @@ stoi = {w: i for i, w in enumerate(vocab)}
 itos = {i: w for i, w in enumerate(vocab)}
 encode = lambda s: [stoi[w] for w in re.findall(r"\w+|[^\w\s]", s) if w in stoi]
 decode = lambda l: " ".join([itos[i] for i in l])
-# --- ADD THIS HERE ---
-# Save vocab immediately so it's always synced with the upcoming model run
+
+# --- FIX 1: SAVE VOCABULARY EARLY ---
+# We save the vocab here so if the script is interrupted, the vocab file
+# remains perfectly synced with the starting point of this model run.
 vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
+vocab_data = {'stoi': stoi, 'itos': itos}
 with open(vocab_path, 'w', encoding='utf-8') as f:
-    json.dump({'stoi': stoi, 'itos': itos}, f)
-print(f"Vocabulary saved to '{vocab_path}'")
+    json.dump(vocab_data, f)
+print(f"Vocabulary saved to '{vocab_path}' early to prevent desync.")
+
 # Train/Test Split
-print("2. Converting to Tensors...")
+print("\n2. Converting to Tensors...")
 data_tensor = torch.tensor([stoi[w] for w in tokens], dtype=torch.long)
 n = int(0.9 * len(data_tensor))
 train_data = data_tensor[:n]
@@ -233,9 +237,30 @@ print(f"Model Parameters: {n_params / 1e6:.2f} Million")
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler('cuda') 
 
-print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
+# --- FIX 2: CHECKPOINT RESUME LOGIC ---
+checkpoint_path = os.path.join(OUTPUT_DIR, 'nano_gpt_checkpoint.pt')
 model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
-for iter in range(max_iters):
+start_iter = 0
+
+if os.path.exists(checkpoint_path):
+    print(f"\nLoading existing checkpoint from {checkpoint_path}...")
+    # weights_only=False is required here because we are loading optimizer states (not just tensors)
+    checkpoint_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Restore model and optimizer brains
+    model.load_state_dict(checkpoint_dict['model_state_dict'])
+    optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+    
+    # Pick up exactly where we left off
+    start_iter = checkpoint_dict['iter'] + 1
+    print(f"Successfully loaded! Resuming training from iteration {start_iter}...")
+else:
+    print("\nNo checkpoint found. Starting from scratch.")
+
+print(f"\n4. Starting Training up to {max_iters} iterations on {device.upper()}...")
+
+# Loop now starts at start_iter instead of 0
+for iter in range(start_iter, max_iters):
     # Free cache frequently to keep memory usage flat
     if iter % 250 == 0:
         torch.cuda.empty_cache()
@@ -243,7 +268,18 @@ for iter in range(max_iters):
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss(model)
         print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        # --- Save Checkpoint (For resuming) ---
+        checkpoint_dict = {
+            'iter': iter,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }
+        torch.save(checkpoint_dict, checkpoint_path)
+        
+        # --- Save Clean Model (For the chat script) ---
         torch.save(model.state_dict(), model_path)
+
     xb, yb = get_batch('train')
     
     with torch.amp.autocast('cuda'):
@@ -254,13 +290,16 @@ for iter in range(max_iters):
     scaler.step(optimizer)
     scaler.update()
 
-print("\n--- Training Complete! Saving Model ---")
-model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
-torch.save(model.state_dict(), model_path)
-print(f"Model saved to '{model_path}'")
+print("\n--- Training Complete! Saving Final Model ---")
 
-vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
-vocab_data = {'stoi': stoi, 'itos': itos}
-with open(vocab_path, 'w', encoding='utf-8') as f:
-    json.dump(vocab_data, f)
-print(f"Vocabulary saved to '{vocab_path}'")
+# Save the final state identically to the intermediate saves
+checkpoint_dict = {
+    'iter': max_iters - 1,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+}
+torch.save(checkpoint_dict, checkpoint_path)
+torch.save(model.state_dict(), model_path)
+
+print(f"Final model saved to '{model_path}'")
+print(f"Final checkpoint saved to '{checkpoint_path}'")
