@@ -1,305 +1,210 @@
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
+"""Train SpiritAI Nano-GPT on prepared theological token bins.
+
+Fresh run target: RTX PRO 4500 / 32GB VRAM, 4-hour set-and-forget window.
+Prepare data first:
+    python prepare_data.py --input /workspace/raw_data/theology.txt --output-dir /workspace/data
+Then train:
+    python nano_gpt.py
+"""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
 import json
-import re
+import math
 import os
-import glob
+from pathlib import Path
+import time
+
 from dotenv import load_dotenv
+import shutil
+import torch
 
-# CRITICAL: Prevent memory fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from model import GPTConfig, GPTLanguageModel
 
-# Clear CUDA cache immediately to free up memory from previous crashes
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+load_dotenv()
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/models"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# RTX PRO 4500 32GB target defaults.
+batch_size = int(os.getenv("BATCH_SIZE", "64"))
+block_size = int(os.getenv("BLOCK_SIZE", "256"))
+max_iters = int(os.getenv("MAX_ITERS", "50000"))
+eval_interval = int(os.getenv("EVAL_INTERVAL", "500"))
+eval_iters = int(os.getenv("EVAL_ITERS", "100"))
+learning_rate = float(os.getenv("LEARNING_RATE", "3e-4"))
+min_lr = float(os.getenv("MIN_LR", "1e-5"))
+weight_decay = float(os.getenv("WEIGHT_DECAY", "0.1"))
+beta1 = float(os.getenv("BETA1", "0.9"))
+beta2 = float(os.getenv("BETA2", "0.95"))
+grad_clip = float(os.getenv("GRAD_CLIP", "1.0"))
+compile_model = os.getenv("COMPILE", "true").lower() in {"1", "true", "yes"}
+always_save_checkpoint = os.getenv("ALWAYS_SAVE_CHECKPOINT", "true").lower() in {"1", "true", "yes"}
+seed = int(os.getenv("SEED", "1337"))
+
+torch.manual_seed(seed)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
-# Load configuration from .env file
-load_dotenv()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+device_type = "cuda" if device == "cuda" else "cpu"
+ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[
+    os.getenv("DTYPE", "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16")
+]
+ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
-# Get settings from environment variables (with defaults if not set)
-DATA_DIR = os.getenv('DATA_DIR', '/workspace/data')
-OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
+train_bin = DATA_DIR / "train.bin"
+val_bin = DATA_DIR / "val.bin"
+vocab_path = DATA_DIR / "vocab.json"
+if not train_bin.exists() or not val_bin.exists() or not vocab_path.exists():
+    raise FileNotFoundError(
+        f"Expected {train_bin}, {val_bin}, and {vocab_path}. Run prepare_data.py first."
+    )
 
-# LOWERED FOR STABILITY: 5090 is powerful but we must avoid the 30GB crash
-batch_size = int(os.getenv('BATCH_SIZE', '8'))  
-block_size = int(os.getenv('BLOCK_SIZE', '256'))
-max_iters = int(os.getenv('MAX_ITERS', '100000'))
-eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
-learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
+with open(vocab_path, "r", encoding="utf-8") as f:
+    vocab_data = json.load(f)
+vocab_size = len(vocab_data["stoi"])
 
-# ARCHITECTURE ADJUSTMENT: 384 is a "sweet spot" for 12 layers on mid-sized VRAM
-n_embd = int(os.getenv('N_EMBD', '384')) 
-n_head = int(os.getenv('N_HEAD', '8'))
-n_layer = int(os.getenv('N_LAYER', '12'))
+train_data = torch.from_file(str(train_bin), shared=False, size=train_bin.stat().st_size // 4, dtype=torch.int32)
+val_data = torch.from_file(str(val_bin), shared=False, size=val_bin.stat().st_size // 4, dtype=torch.int32)
+if len(train_data) <= block_size or len(val_data) <= block_size:
+    raise ValueError("train.bin/val.bin are too small for the configured block_size")
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+config = GPTConfig.from_env(vocab_size=vocab_size)
+config.block_size = block_size
+config.to_json(OUTPUT_DIR / "config.json")
+shutil.copyfile(vocab_path, OUTPUT_DIR / "vocab.json")
 
-print(f"Using device: {device}")
+print(f"Using device: {device} ({ptdtype})")
 print(f"Data directory: {DATA_DIR}")
 print(f"Output directory: {OUTPUT_DIR}")
+print(f"Tokens: train={len(train_data):,}, val={len(val_data):,}, vocab={vocab_size:,}")
+print(
+    "Config: "
+    f"layers={config.n_layer}, heads={config.n_head}, embd={config.n_embd}, "
+    f"block={config.block_size}, dropout={config.dropout}, batch={batch_size}"
+)
 
-print("\n1. Loading and Tokenizing Dataset...")
-raw_text = []
 
-# Load original JSON if it exists
-bible_path = os.path.join(DATA_DIR, "CPDV.json")
-if os.path.exists(bible_path):
-    print(f" - Loading {bible_path}")
-    with open(bible_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for book in data.get("books", []):
-        for chapter in book.get("chapters", []):
-            for verse in chapter.get("verses", []):
-                raw_text.append(verse["text"])
-
-# Load all .txt and .md files
-for filepath in glob.glob(os.path.join(DATA_DIR, "*.txt")) + glob.glob(os.path.join(DATA_DIR, "*.md")):
-    print(f" - Loading {filepath}")
-    with open(filepath, "r", encoding="utf-8") as f:
-        raw_text.append(f.read())
-
-if not raw_text:
-    print(f"Error: No text data found in {DATA_DIR}")
-    exit(1)
-
-full_text = " ".join(raw_text)
-
-# Basic word/punctuation tokenizer
-tokens = re.findall(r"\w+|[^\w\s]", full_text)
-vocab = sorted(list(set(tokens)))
-vocab_size = len(vocab)
-print(f"Total tokens in dataset: {len(tokens)}")
-print(f"Vocabulary size: {vocab_size}")
-
-# Create mappings from word to integer and integer to word
-stoi = {w: i for i, w in enumerate(vocab)}
-itos = {i: w for i, w in enumerate(vocab)}
-encode = lambda s: [stoi[w] for w in re.findall(r"\w+|[^\w\s]", s) if w in stoi]
-decode = lambda l: " ".join([itos[i] for i in l])
-
-# --- FIX 1: SAVE VOCABULARY EARLY ---
-# We save the vocab here so if the script is interrupted, the vocab file
-# remains perfectly synced with the starting point of this model run.
-vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
-vocab_data = {'stoi': stoi, 'itos': itos}
-with open(vocab_path, 'w', encoding='utf-8') as f:
-    json.dump(vocab_data, f)
-print(f"Vocabulary saved to '{vocab_path}' early to prevent desync.")
-
-# Train/Test Split
-print("\n2. Converting to Tensors...")
-data_tensor = torch.tensor([stoi[w] for w in tokens], dtype=torch.long)
-n = int(0.9 * len(data_tensor))
-train_data = data_tensor[:n]
-val_data = data_tensor[n:]
-
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
+def get_batch(split: str) -> tuple[torch.Tensor, torch.Tensor]:
+    data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    return x.to(device), y.to(device)
+    x = torch.stack([data[int(i) : int(i) + block_size].long() for i in ix])
+    y = torch.stack([data[int(i) + 1 : int(i) + 1 + block_size].long() for i in ix])
+    if device_type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
+
 
 @torch.no_grad()
-def estimate_loss(model):
-    out = {}
+def estimate_loss(model: GPTLanguageModel) -> dict[str, float]:
+    out: dict[str, float] = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(50)
-        for k in range(50):
-            X, Y = get_batch(split)
-            with torch.amp.autocast('cuda'):
-                logits, loss = model(X, Y)
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            xb, yb = get_batch(split)
+            with ctx:
+                _, loss = model(xb, yb)
+            assert loss is not None
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        out[split] = float(losses.mean())
     model.train()
     return out
 
-# --- GPT Architecture ---
 
-class Head(nn.Module):
-    """ One head of self-attention """
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+def get_lr(iter_num: int) -> float:
+    if iter_num >= max_iters:
+        return min_lr
+    decay_ratio = iter_num / max_iters
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)   
-        q = self.query(x) 
-        
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        
-        v = self.value(x)
-        out = wei @ v
-        return out
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
+model = GPTLanguageModel(config).to(device)
+raw_model = model
+n_params = sum(p.numel() for p in model.parameters())
+print(f"Model parameters: {n_params / 1e6:.2f}M")
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+scaler = torch.amp.GradScaler(enabled=(device_type == "cuda" and ptdtype == torch.float16))
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
-        return out
-
-class FeedForward(nn.Module):
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-class GPTLanguageModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx) 
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
-        x = tok_emb + pos_emb
-        
-        # Applying Gradient Checkpointing to every block
-        for block in self.blocks:
-            if self.training:
-                # use_reentrant=False is the modern way to handle this
-                x = checkpoint(block, x, use_reentrant=False)
-            else:
-                x = block(x)
-            
-        x = self.ln_f(x)
-        logits = self.lm_head(x) 
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits, loss
-
-    def generate(self, idx, max_new_tokens, temperature=0.8):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 0.01)
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-# --- Training ---
-print("\n3. Initializing SpiritAI Nano-GPT...")
-model = GPTLanguageModel()
-m = model.to(device)
-
-# Print number of parameters
-n_params = sum(p.numel() for p in m.parameters())
-print(f"Model Parameters: {n_params / 1e6:.2f} Million")
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-scaler = torch.amp.GradScaler('cuda') 
-
-# --- FIX 2: CHECKPOINT RESUME LOGIC ---
-checkpoint_path = os.path.join(OUTPUT_DIR, 'nano_gpt_checkpoint.pt')
-model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
+checkpoint_path = OUTPUT_DIR / "nano_gpt_checkpoint.pt"
+model_path = OUTPUT_DIR / "nano_gpt_model.pt"
+best_val_loss = float("inf")
 start_iter = 0
 
-if os.path.exists(checkpoint_path):
-    print(f"\nLoading existing checkpoint from {checkpoint_path}...")
-    # weights_only=False is required here because we are loading optimizer states (not just tensors)
-    checkpoint_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    # Restore model and optimizer brains
-    model.load_state_dict(checkpoint_dict['model_state_dict'])
-    optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
-    
-    # Pick up exactly where we left off
-    start_iter = checkpoint_dict['iter'] + 1
-    print(f"Successfully loaded! Resuming training from iteration {start_iter}...")
-else:
-    print("\nNo checkpoint found. Starting from scratch.")
+if checkpoint_path.exists() and os.getenv("RESUME", "true").lower() in {"1", "true", "yes"}:
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    raw_model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_iter = int(checkpoint.get("iter", -1)) + 1
+    best_val_loss = float(checkpoint.get("best_val_loss", best_val_loss))
+    print(f"Resuming from iteration {start_iter}; best val loss {best_val_loss:.4f}")
 
-print(f"\n4. Starting Training up to {max_iters} iterations on {device.upper()}...")
+if compile_model and device_type == "cuda":
+    print("Compiling model with torch.compile...")
+    model = torch.compile(model)
 
-# Loop now starts at start_iter instead of 0
-for iter in range(start_iter, max_iters):
-    # Free cache frequently to keep memory usage flat
-    if iter % 250 == 0:
-        torch.cuda.empty_cache()
+print(f"Starting training for {max_iters:,} iterations")
+t0 = time.time()
+for iter_num in range(start_iter, max_iters):
+    lr = get_lr(iter_num)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
 
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss(model)
-        print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        
-        # --- Save Checkpoint (For resuming) ---
-        checkpoint_dict = {
-            'iter': iter,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        torch.save(checkpoint_dict, checkpoint_path)
-        
-        # --- Save Clean Model (For the chat script) ---
-        torch.save(model.state_dict(), model_path)
+    if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+        losses = estimate_loss(raw_model)
+        elapsed_hours = (time.time() - t0) / 3600
+        print(
+            f"step {iter_num:6d}: train {losses['train']:.4f}, val {losses['val']:.4f}, "
+            f"lr {lr:.2e}, elapsed {elapsed_hours:.2f}h"
+        )
+        if losses["val"] < best_val_loss or always_save_checkpoint:
+            best_val_loss = min(best_val_loss, losses["val"])
+            checkpoint = {
+                "iter": iter_num,
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_loss": best_val_loss,
+                "config": config.__dict__,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            torch.save(raw_model.state_dict(), model_path)
+            config.to_json(OUTPUT_DIR / "config.json")
+            print(f"saved checkpoint; best val loss {best_val_loss:.4f}")
 
-    xb, yb = get_batch('train')
-    
-    with torch.amp.autocast('cuda'):
-        logits, loss = model(xb, yb)
-        
+    xb, yb = get_batch("train")
+    with ctx:
+        _, loss = model(xb, yb)
+    assert loss is not None
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
+    if grad_clip > 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
     scaler.step(optimizer)
     scaler.update()
 
-print("\n--- Training Complete! Saving Final Model ---")
-
-# Save the final state identically to the intermediate saves
-checkpoint_dict = {
-    'iter': max_iters - 1,
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-}
-torch.save(checkpoint_dict, checkpoint_path)
-torch.save(model.state_dict(), model_path)
-
-print(f"Final model saved to '{model_path}'")
-print(f"Final checkpoint saved to '{checkpoint_path}'")
+print("Training complete; saving final model")
+torch.save(raw_model.state_dict(), model_path)
+torch.save(
+    {
+        "iter": max_iters - 1,
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_loss": best_val_loss,
+        "config": config.__dict__,
+    },
+    checkpoint_path,
+)
+config.to_json(OUTPUT_DIR / "config.json")

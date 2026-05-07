@@ -1,173 +1,106 @@
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import json
-import re
-import os
-from dotenv import load_dotenv
+"""Chat with a trained SpiritAI Nano-GPT checkpoint."""
 
-# Load configuration from .env file
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+
+from dotenv import load_dotenv
+import torch
+
+from model import GPTConfig, GPTLanguageModel
+
 load_dotenv()
 
-# Get settings from environment variables (must match training script)
-OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
-block_size = int(os.getenv('BLOCK_SIZE', '256'))
-n_embd = int(os.getenv('N_EMBD', '256'))
-n_head = int(os.getenv('N_HEAD', '8'))
-n_layer = int(os.getenv('N_LAYER', '6'))
-max_new_tokens = int(os.getenv('MAX_NEW_TOKENS', '100'))
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/models"))
+max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "160"))
+temperature = float(os.getenv("TEMPERATURE", "0.8"))
+top_k = int(os.getenv("TOP_K", "50"))
+repetition_penalty = float(os.getenv("REPETITION_PENALTY", "1.15"))
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+vocab_path = OUTPUT_DIR / "vocab.json"
+if not vocab_path.exists():
+    vocab_path = DATA_DIR / "vocab.json"
+config_path = OUTPUT_DIR / "config.json"
+model_path = OUTPUT_DIR / "nano_gpt_model.pt"
+
+if not vocab_path.exists():
+    raise FileNotFoundError(f"vocab.json not found at {vocab_path}; run prepare_data.py first")
+if not config_path.exists():
+    raise FileNotFoundError(f"config.json not found at {config_path}; run nano_gpt.py first")
+if not model_path.exists():
+    raise FileNotFoundError(f"nano_gpt_model.pt not found at {model_path}; run nano_gpt.py first")
+
+with open(vocab_path, "r", encoding="utf-8") as f:
+    vocab_data = json.load(f)
+stoi = vocab_data["stoi"]
+itos = {int(k): v for k, v in vocab_data["itos"].items()}
+
+config = GPTConfig.from_json(config_path)
+config.vocab_size = len(stoi)
+model = GPTLanguageModel(config)
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+model.to(device)
+model.eval()
+
+TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def encode(text: str) -> list[int]:
+    unk = stoi.get("<unk>")
+    ids: list[int] = []
+    for token in TOKEN_RE.findall(text):
+        if token in stoi:
+            ids.append(stoi[token])
+        elif token.lower() in stoi:
+            ids.append(stoi[token.lower()])
+        elif unk is not None:
+            ids.append(unk)
+    return ids
+
+
+def decode(ids: list[int]) -> str:
+    text = " ".join(itos[int(i)] for i in ids)
+    text = re.sub(r"\s+([.,;:!?%\]\)])", r"\1", text)
+    text = re.sub(r"([\[\(])\s+", r"\1", text)
+    text = re.sub(r"\s+'\s+", "'", text)
+    return text.strip()
+
 
 print(f"Using device: {device}")
-
-# --- Load Vocabulary ---
-print("Loading vocabulary...")
-vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
-try:
-    with open(vocab_path, 'r', encoding='utf-8') as f:
-        vocab_data = json.load(f)
-except FileNotFoundError:
-    print(f"Error: vocab.json not found at {vocab_path}")
-    print(f"You must run nano_gpt.py first!")
-    exit(1)
-
-stoi = vocab_data['stoi']
-# JSON saves integer keys as strings, so we must convert them back to integers
-itos = {int(k): v for k, v in vocab_data['itos'].items()}
-vocab_size = len(stoi)
-
-encode = lambda s: [stoi[w] for w in re.findall(r"\w+|[^\w\s]", s.lower() if "david" not in s.lower() else s) if w in stoi]
-decode = lambda l: " ".join([itos[i] for i in l])
-
-# --- GPT Architecture (MUST MATCH TRAINING SCRIPT) ---
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)   
-        q = self.query(x) 
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        v = self.value(x)
-        return wei @ v
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.proj(out)
-
-class FeedForward(nn.Module):
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-class GPTLanguageModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx) 
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x) 
-        return logits, None
-
-    def generate(self, idx, max_new_tokens, temperature=2.0): # Add temperature here
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            
-            # FOCUS: Scale the logits by temperature before softmax
-            logits = logits[:, -1, :] / temperature 
-            
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-# --- Load Model Weights ---
-print("Loading model weights...")
-model = GPTLanguageModel()
-model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
-try:
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-except FileNotFoundError:
-    print(f"Error: nano_gpt_model.pt not found at {model_path}")
-    print("You must run nano_gpt.py first!")
-    exit(1)
-
-m = model.to(device)
-m.eval() # Set model to evaluation mode (turns off training mechanics)
-
-print("\nModel Loaded! Ready to chat.")
-print("Type 'exit' to stop.")
-print("-" * 40)
+print(
+    f"Loaded SpiritAI: embd={config.n_embd}, heads={config.n_head}, layers={config.n_layer}, "
+    f"block={config.block_size}, vocab={config.vocab_size}"
+)
+print(f"Sampling: top_k={top_k}, temperature={temperature}, repetition_penalty={repetition_penalty}")
+print("Type 'exit' or 'quit' to stop.")
+print("-" * 60)
 
 while True:
-    user_input = input("\nYou: ")
-    if user_input.lower() in ['exit', 'quit']:
+    user_input = input("\nYou: ").strip()
+    if user_input.lower() in {"exit", "quit"}:
         print("Goodbye!")
         break
-    if not user_input.strip():
+    if not user_input:
         continue
-    
-    # Encode user input using our vocabulary
-    context_idx = encode(user_input)
+
+    prompt = f"Question: {user_input}\nAnswer:"
+    context_idx = encode(prompt)
     if not context_idx:
-        print("AI: [I didn't recognize any of those words.]")
+        print("AI: [No recognizable tokens in prompt.]")
         continue
-        
-    x = torch.tensor([context_idx], dtype=torch.long, device=device)
-    
-    # Generate tokens (amount from config)
+
+    x = torch.tensor([context_idx[-config.block_size :]], dtype=torch.long, device=device)
     with torch.no_grad():
-        y = m.generate(x, max_new_tokens=max_new_tokens)
-    
-    # The output includes our prompt, so we decode the whole thing
-    out_text = decode(y[0].tolist())
-    
-    # Basic formatting to remove spaces before punctuation
-    out_text = re.sub(r'\s+([.,;:!?])', r'\1', out_text)
-    
-    print(f"AI: {out_text}")
+        y = model.generate(
+            x,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )
+    print(f"AI: {decode(y[0].tolist())}")
