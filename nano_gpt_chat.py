@@ -113,11 +113,14 @@ class GPTLanguageModel(nn.Module):
         logits = self.lm_head(x) 
         return logits, None
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature=0.8): # Add temperature here
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] 
+            logits, loss = self(idx_cond)
+            
+            # FOCUS: Scale the logits by temperature before softmax
+            logits = logits[:, -1, :] / temperature 
+            
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
