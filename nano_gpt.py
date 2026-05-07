@@ -79,7 +79,12 @@ stoi = {w: i for i, w in enumerate(vocab)}
 itos = {i: w for i, w in enumerate(vocab)}
 encode = lambda s: [stoi[w] for w in re.findall(r"\w+|[^\w\s]", s) if w in stoi]
 decode = lambda l: " ".join([itos[i] for i in l])
-
+# --- ADD THIS HERE ---
+# Save vocab immediately so it's always synced with the upcoming model run
+vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
+with open(vocab_path, 'w', encoding='utf-8') as f:
+    json.dump({'stoi': stoi, 'itos': itos}, f)
+print(f"Vocabulary saved to '{vocab_path}'")
 # Train/Test Split
 print("2. Converting to Tensors...")
 data_tensor = torch.tensor([stoi[w] for w in tokens], dtype=torch.long)
