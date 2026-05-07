@@ -2,7 +2,7 @@
 
 Fresh run target: RTX PRO 4500 / 32GB VRAM, 4-hour set-and-forget window.
 Prepare data first:
-    python prepare_data.py --input /workspace/raw_data/theology.txt --output-dir /workspace/data
+    python prepare_data.py --input $WORKSPACE_PATH/raw_data/theology.txt --output-dir $WORKSPACE_PATH/data
 Then train:
     python nano_gpt.py
 """
@@ -18,17 +18,16 @@ import signal
 import time
 from typing import Any
 
-from dotenv import load_dotenv
 import shutil
 import torch
 
 from model import GPTConfig, GPTLanguageModel
+from paths import workspace_path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-load_dotenv()
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/models"))
+DATA_DIR = workspace_path("data")
+OUTPUT_DIR = workspace_path("models")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # RTX PRO 4500 32GB target defaults.
