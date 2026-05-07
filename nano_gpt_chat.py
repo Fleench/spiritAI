@@ -113,7 +113,7 @@ class GPTLanguageModel(nn.Module):
         logits = self.lm_head(x) 
         return logits, None
 
-    def generate(self, idx, max_new_tokens, temperature=0.8): # Add temperature here
+    def generate(self, idx, max_new_tokens, temperature=2.0): # Add temperature here
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
