@@ -7,20 +7,24 @@ import os
 import glob
 from dotenv import load_dotenv
 
+# Clear CUDA cache immediately to free up memory from previous crashes
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 # Load configuration from .env file
 load_dotenv()
 
 # Get settings from environment variables (with defaults if not set)
 DATA_DIR = os.getenv('DATA_DIR', '/workspace/data')
 OUTPUT_DIR = os.getenv('OUTPUT_DIR', '/workspace/models')
-batch_size = int(os.getenv('BATCH_SIZE', '32'))
+batch_size = int(os.getenv('BATCH_SIZE', '16'))
 block_size = int(os.getenv('BLOCK_SIZE', '256'))
-max_iters = int(os.getenv('MAX_ITERS', '50000'))
+max_iters = int(os.getenv('MAX_ITERS', '10000'))
 eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
 learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
-n_embd = int(os.getenv('N_EMBD', '256'))
-n_head = int(os.getenv('N_HEAD', '8'))
-n_layer = int(os.getenv('N_LAYER', '6'))
+n_embd = int(os.getenv('N_EMBD', '768'))
+n_head = int(os.getenv('N_HEAD', '12'))
+n_layer = int(os.getenv('N_LAYER', '12'))
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -90,7 +94,9 @@ def estimate_loss(model):
         losses = torch.zeros(50)
         for k in range(50):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            # Use autocast for evaluation too
+            with torch.amp.autocast('cuda'):
+                logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -145,7 +151,6 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
@@ -187,26 +192,36 @@ class GPTLanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature=0.8):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
-            logits = logits[:, -1, :] # focuses only on the last time step
+            # Focus on last time step and apply temperature
+            logits = logits[:, -1, :] / max(temperature, 0.01)
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
 # --- Training ---
-print("\n3. Initializing Nano-GPT Model...")
+print("\n3. Initializing SpiritAI Nano-GPT...")
 model = GPTLanguageModel()
 m = model.to(device)
+
+# Enable torch.compile for speed boost on 5090
+if hasattr(torch, 'compile'):
+    try:
+        print(" - Compiling model for Blackwell architecture...")
+        m = torch.compile(m)
+    except Exception as e:
+        print(f" - Note: Could not compile model ({e}), continuing with standard mode.")
 
 # Print number of parameters
 n_params = sum(p.numel() for p in m.parameters())
 print(f"Model Parameters: {n_params / 1e6:.2f} Million")
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+scaler = torch.amp.GradScaler('cuda') # For Mixed Precision
 
 print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
 for iter in range(max_iters):
@@ -215,26 +230,29 @@ for iter in range(max_iters):
         print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
     xb, yb = get_batch('train')
-    logits, loss = model(xb, yb)
+    
+    # Mixed precision training loop
+    with torch.amp.autocast('cuda'):
+        logits, loss = model(xb, yb)
+        
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
 
 print("\n--- Training Complete! Saving Model ---")
 
 # Save the model weights
 model_path = os.path.join(OUTPUT_DIR, 'nano_gpt_model.pt')
-torch.save(m.state_dict(), model_path)
+# Using state_dict to ensure we can load it easily later
+torch.save(model.state_dict(), model_path)
 print(f"Model saved to '{model_path}'")
 
-# Save the vocabulary so the chat app knows how to convert words to numbers
+# Save vocabulary
 vocab_path = os.path.join(OUTPUT_DIR, 'vocab.json')
-vocab_data = {
-    'stoi': stoi,
-    'itos': itos
-}
+vocab_data = {'stoi': stoi, 'itos': itos}
 with open(vocab_path, 'w', encoding='utf-8') as f:
     json.dump(vocab_data, f)
 print(f"Vocabulary saved to '{vocab_path}'")
 
-print("\nYou can now run the chat app!")
+print("\nYou are ready to chat with the Church Fathers!")
