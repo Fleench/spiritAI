@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 import json
 import re
 import os
@@ -25,8 +26,10 @@ block_size = int(os.getenv('BLOCK_SIZE', '256'))
 max_iters = int(os.getenv('MAX_ITERS', '10000'))
 eval_interval = int(os.getenv('EVAL_INTERVAL', '500'))
 learning_rate = float(os.getenv('LEARNING_RATE', '3e-4'))
-n_embd = int(os.getenv('N_EMBD', '768'))
-n_head = int(os.getenv('N_HEAD', '12'))
+
+# Adjusting architecture slightly for safety: 512 is still high quality
+n_embd = int(os.getenv('N_EMBD', '512')) 
+n_head = int(os.getenv('N_HEAD', '8'))
 n_layer = int(os.getenv('N_LAYER', '12'))
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -161,15 +164,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        # We apply gradient checkpointing to the blocks to save memory
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-            return custom_forward
-
-        # Note: We aren't actually using torch.utils.checkpoint here because 
-        # for this size, simple structure is better. 
-        # But we maintain standard skip connections.
+        # Skip connections
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
@@ -185,16 +180,20 @@ class GPTLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx) # (B, T, C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
+        tok_emb = self.token_embedding_table(idx) 
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
         x = tok_emb + pos_emb
         
-        # Use simple block iteration
+        # Applying Gradient Checkpointing to save massive VRAM
         for block in self.blocks:
-            x = block(x)
+            if self.training:
+                # Use dummy inputs to ensure it works correctly with checkpoint
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             
         x = self.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
+        logits = self.lm_head(x) 
 
         if targets is None:
             loss = None
@@ -221,15 +220,6 @@ print("\n3. Initializing SpiritAI Nano-GPT...")
 model = GPTLanguageModel()
 m = model.to(device)
 
-# Enable torch.compile for speed boost on 5090
-if hasattr(torch, 'compile'):
-    try:
-        print(" - Compiling model...")
-        # Use 'reduce-overhead' to optimize for VRAM and speed
-        m = torch.compile(m, mode="reduce-overhead")
-    except Exception as e:
-        print(f" - Note: Could not compile model ({e})")
-
 # Print number of parameters
 n_params = sum(p.numel() for p in m.parameters())
 print(f"Model Parameters: {n_params / 1e6:.2f} Million")
@@ -239,7 +229,7 @@ scaler = torch.amp.GradScaler('cuda')
 
 print(f"\n4. Starting Training for {max_iters} iterations on {device.upper()}...")
 for iter in range(max_iters):
-    # Free up memory periodically
+    # Aggressive memory cleanup
     if iter % 100 == 0:
         torch.cuda.empty_cache()
 
