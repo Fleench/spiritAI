@@ -1,0 +1,9 @@
+# Core training and inference dependencies
+torch>=2.2
+python-dotenv>=1.0
+
+# Corpus download/preparation utilities
+requests>=2.31
+
+# Optional helper used by tmp.py for web scraping experiments
+playwright>=1.40
