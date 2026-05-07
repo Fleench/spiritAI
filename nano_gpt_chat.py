@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import re
 
-from dotenv import load_dotenv
 import torch
 
 from model import GPTConfig, GPTLanguageModel
+from paths import workspace_path
 
-load_dotenv()
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/models"))
+DATA_DIR = workspace_path("data")
+OUTPUT_DIR = workspace_path("models")
 max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "160"))
 temperature = float(os.getenv("TEMPERATURE", "0.8"))
 top_k = int(os.getenv("TOP_K", "50"))

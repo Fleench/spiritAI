@@ -2,7 +2,7 @@
 
 Usage:
     python prepare_data.py
-    python prepare_data.py --input /workspace/raw_data/theology.txt --output-dir /workspace/data
+    python prepare_data.py --input $WORKSPACE_PATH/raw_data/theology.txt --output-dir $WORKSPACE_PATH/data
 
 If --input is omitted, the script auto-detects cleaned .txt/.md files in
 the output directory (for example files produced by sanatize.py) and combines
@@ -22,14 +22,15 @@ import argparse
 from collections import Counter
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import unicodedata
 
 from array import array
 
-DEFAULT_RAW_DATA_DIR = Path(os.getenv("RAW_DATA_DIR", "/workspace/raw_data"))
+from paths import workspace_path
+
+DEFAULT_RAW_DATA_DIR = workspace_path("raw_data")
 
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 SPLIT_WORD_FIXES = {
@@ -183,7 +184,7 @@ def main() -> None:
             "If omitted, cleaned corpus files are auto-detected."
         ),
     )
-    parser.add_argument("--output-dir", default=os.getenv("DATA_DIR", "/workspace/data"))
+    parser.add_argument("--output-dir", default=workspace_path("data"))
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--min-freq", type=int, default=1, help="Minimum token frequency kept in vocab.")
     args = parser.parse_args()

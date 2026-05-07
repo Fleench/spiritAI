@@ -2,20 +2,20 @@
 
 The project now uses prepare_data.py to sanitize, deduplicate, tokenize, and
 write train.bin/val.bin. This wrapper keeps the old script name working for
-cleaning files into /workspace/data without tokenization.
+cleaning files into the workspace data directory without tokenization.
 """
 
 from __future__ import annotations
 
 import glob
 import json
-import os
 from pathlib import Path
 
+from paths import workspace_path
 from prepare_data import deduplicate_paragraphs, sanitize_text
 
-RAW_DATA_DIR = Path(os.getenv("RAW_DATA_DIR", "/workspace/raw_data"))
-CLEAN_DATA_DIR = Path(os.getenv("DATA_DIR", "/workspace/data"))
+RAW_DATA_DIR = workspace_path("raw_data")
+CLEAN_DATA_DIR = workspace_path("data")
 
 
 def clean_text(text: str) -> str:

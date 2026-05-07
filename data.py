@@ -14,6 +14,8 @@ import re
 
 import requests
 
+from paths import workspace_path
+
 SOURCES = [
     {
         "name": "ante_nicene_fathers_complete",
@@ -75,7 +77,7 @@ def download_source(url: str, timeout: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download SpiritAI theological source texts.")
-    parser.add_argument("--output-dir", default="/workspace/raw_data")
+    parser.add_argument("--output-dir", default=workspace_path("raw_data"))
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--split-sections", action="store_true")
     args = parser.parse_args()
@@ -98,7 +100,7 @@ def main() -> None:
     combined_path = output_dir / "theology_sources_combined.txt"
     combined_path.write_text("".join(combined_parts).strip(), encoding="utf-8")
     print(f"Combined corpus written to {combined_path}")
-    print("Next: python prepare_data.py --input /workspace/raw_data/theology_sources_combined.txt")
+    print(f"Next: python prepare_data.py --input {workspace_path('raw_data', 'theology_sources_combined.txt')}")
 
 
 if __name__ == "__main__":
