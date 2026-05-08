@@ -9,11 +9,13 @@ Usage:
 
 Configuration:
     Put GEMINI_API_KEY=your_key_here in .env (or export it in the shell).
+    Set --concurrent-ai-calls, or CONCURRENT_AI_CALLS, to control parallel calls.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import json
@@ -22,6 +24,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 
@@ -37,6 +40,7 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_SLEEP_SECONDS = 3.0
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_CONCURRENT_AI_CALLS = int(os.getenv("CONCURRENT_AI_CALLS", "5"))
 DEFAULT_DEDUPE_THRESHOLD = 0.9
 MIN_PROMPT_CHARS = 10
 MAX_PROMPT_CHARS = 200
@@ -80,15 +84,22 @@ class RateLimitState:
     delay_seconds: float
     minimum_delay_seconds: float
     rate_limit_backoff_seconds: float
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def current_delay(self) -> float:
+        with self.lock:
+            return self.delay_seconds
 
     def slow_down(self) -> float:
-        self.delay_seconds = max(self.delay_seconds * 2, self.rate_limit_backoff_seconds)
-        return self.delay_seconds
+        with self.lock:
+            self.delay_seconds = max(self.delay_seconds * 2, self.rate_limit_backoff_seconds)
+            return self.delay_seconds
 
     def speed_up(self) -> float:
-        if self.delay_seconds > self.minimum_delay_seconds:
-            self.delay_seconds = max(self.minimum_delay_seconds, self.delay_seconds * 0.8)
-        return self.delay_seconds
+        with self.lock:
+            if self.delay_seconds > self.minimum_delay_seconds:
+                self.delay_seconds = max(self.minimum_delay_seconds, self.delay_seconds * 0.8)
+            return self.delay_seconds
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +161,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_RETRIES,
         help="Retry each failed chunk up to this many times with exponential backoff.",
+    )
+    parser.add_argument(
+        "--concurrent-ai-calls",
+        type=int,
+        default=DEFAULT_CONCURRENT_AI_CALLS,
+        help=(
+            "Maximum number of Gemini chunks to process at the same time. "
+            "Defaults to CONCURRENT_AI_CALLS or 5."
+        ),
     )
     parser.add_argument(
         "--dedupe-threshold",
@@ -398,6 +418,42 @@ def is_duplicate_prompt(prompt: str, seen_prompts: set[str], threshold: float) -
     return any(SequenceMatcher(None, normalized, seen).ratio() >= threshold for seen in seen_prompts)
 
 
+@dataclass(frozen=True)
+class ChunkGenerationResult:
+    """Generated Q&A and validation metadata for one source chunk."""
+
+    chunk: TextChunk
+    qa_pairs: list[dict[str, str]]
+    rejected: list[str]
+    failure_reason: str | None
+
+
+def process_chunk(
+    model: Any,
+    chunk: TextChunk,
+    max_retries: int,
+    rate_limit: RateLimitState,
+    logger: logging.Logger,
+) -> ChunkGenerationResult:
+    """Generate Q&A for one chunk and throttle this worker before it takes more work."""
+    qa_pairs, rejected, failure_reason = generate_with_retries(
+        model=model,
+        chunk=chunk,
+        max_retries=max_retries,
+        rate_limit=rate_limit,
+        logger=logger,
+    )
+    delay = rate_limit.current_delay()
+    if delay > 0:
+        time.sleep(delay)
+    return ChunkGenerationResult(
+        chunk=chunk,
+        qa_pairs=qa_pairs,
+        rejected=rejected,
+        failure_reason=failure_reason,
+    )
+
+
 def generate_with_retries(
     model: Any,
     chunk: TextChunk,
@@ -409,7 +465,7 @@ def generate_with_retries(
     from google.api_core.exceptions import ResourceExhausted
 
     attempts = max_retries + 1
-    delay = max(1.0, rate_limit.delay_seconds)
+    delay = max(1.0, rate_limit.current_delay())
     for attempt in range(1, attempts + 1):
         try:
             qa_pairs, rejected = generate_qa_for_chunk(model, chunk.text)
@@ -463,15 +519,18 @@ def main() -> None:
         raise ValueError("--sleep-seconds cannot be negative")
     if args.rate_limit_backoff_seconds < 0:
         raise ValueError("--rate-limit-backoff-seconds cannot be negative")
+    if args.concurrent_ai_calls < 1:
+        raise ValueError("--concurrent-ai-calls must be at least 1")
     if not 0 <= args.dedupe_threshold <= 1:
         raise ValueError("--dedupe-threshold must be between 0 and 1")
 
     logger.info(
-        "event=start input=%s output=%s state=%s log=%s",
+        "event=start input=%s output=%s state=%s log=%s concurrent_ai_calls=%s",
         input_file,
         output_file,
         state_file,
         log_file,
+        args.concurrent_ai_calls,
     )
     model = configure_gemini(args.model)
 
@@ -502,83 +561,109 @@ def main() -> None:
         rate_limit_backoff_seconds=args.rate_limit_backoff_seconds,
     )
 
-    with output_file.open("a", encoding="utf-8") as f:
-        for chunk in chunks:
-            existing = chunk_state.get(chunk.chunk_id, {})
-            if existing.get("status") in {"success", "skipped"}:
-                stats.resumed_chunks += 1
-                logger.info(
-                    "chunk=%s/%s status=resumed previous_status=%s",
-                    chunk.number,
-                    len(chunks),
-                    existing.get("status"),
-                )
-                continue
-
-            if len(chunk.text) < args.min_chunk_chars:
-                reason = f"chunk {chunk.number}: below min size ({len(chunk.text)} chars)"
-                stats.skipped_chunks.append(reason)
-                chunk_state[chunk.chunk_id] = {"status": "skipped", "reason": reason}
-                save_resume_state(state_file, state)
-                logger.info("chunk=%s/%s status=skipped reason=%s", chunk.number, len(chunks), reason)
-                continue
-
-            logger.info("chunk=%s/%s status=processing chars=%s", chunk.number, len(chunks), len(chunk.text))
-            qa_pairs, rejected, failure_reason = generate_with_retries(
-                model=model,
-                chunk=chunk,
-                max_retries=args.max_retries,
-                rate_limit=rate_limit,
-                logger=logger,
+    pending_chunks: list[TextChunk] = []
+    for chunk in chunks:
+        existing = chunk_state.get(chunk.chunk_id, {})
+        if existing.get("status") in {"success", "skipped"}:
+            stats.resumed_chunks += 1
+            logger.info(
+                "chunk=%s/%s status=resumed previous_status=%s",
+                chunk.number,
+                len(chunks),
+                existing.get("status"),
             )
-            stats.invalid_pairs += len(rejected)
+            continue
 
-            if failure_reason:
-                reason = f"chunk {chunk.number}: {failure_reason}"
-                stats.failed_chunks.append(reason)
-                chunk_state[chunk.chunk_id] = {
-                    "status": "failed",
-                    "reason": reason,
-                    "invalid_pairs": rejected,
-                }
-                save_resume_state(state_file, state)
-                logger.error("chunk=%s/%s status=failed reason=%s", chunk.number, len(chunks), failure_reason)
-            else:
-                written_pairs = 0
-                duplicate_pairs = 0
-                for pair in qa_pairs:
-                    if not args.disable_dedupe and is_duplicate_prompt(
-                        pair["prompt"], seen_prompts, args.dedupe_threshold
-                    ):
-                        duplicate_pairs += 1
-                        continue
-                    f.write(json.dumps(pair, ensure_ascii=False) + "\n")
-                    seen_prompts.add(normalize_prompt(pair["prompt"]))
-                    written_pairs += 1
-                f.flush()
+        if len(chunk.text) < args.min_chunk_chars:
+            reason = f"chunk {chunk.number}: below min size ({len(chunk.text)} chars)"
+            stats.skipped_chunks.append(reason)
+            chunk_state[chunk.chunk_id] = {"status": "skipped", "reason": reason}
+            save_resume_state(state_file, state)
+            logger.info("chunk=%s/%s status=skipped reason=%s", chunk.number, len(chunks), reason)
+            continue
 
-                stats.processed_chunks += 1
-                stats.successful_pairs += written_pairs
-                stats.duplicate_pairs += duplicate_pairs
-                chunk_state[chunk.chunk_id] = {
-                    "status": "success",
-                    "pairs_written": written_pairs,
-                    "duplicates_skipped": duplicate_pairs,
-                    "invalid_pairs": rejected,
-                }
-                save_resume_state(state_file, state)
-                logger.info(
-                    "chunk=%s/%s status=success pairs_written=%s duplicates=%s invalid=%s next_delay=%.2fs",
-                    chunk.number,
-                    len(chunks),
-                    written_pairs,
-                    duplicate_pairs,
-                    len(rejected),
-                    rate_limit.delay_seconds,
+        pending_chunks.append(chunk)
+
+    logger.info(
+        "event=dispatch pending_chunks=%s concurrent_ai_calls=%s",
+        len(pending_chunks),
+        args.concurrent_ai_calls,
+    )
+
+    def record_result(result: ChunkGenerationResult) -> None:
+        chunk = result.chunk
+        stats.invalid_pairs += len(result.rejected)
+
+        if result.failure_reason:
+            reason = f"chunk {chunk.number}: {result.failure_reason}"
+            stats.failed_chunks.append(reason)
+            chunk_state[chunk.chunk_id] = {
+                "status": "failed",
+                "reason": reason,
+                "invalid_pairs": result.rejected,
+            }
+            save_resume_state(state_file, state)
+            logger.error("chunk=%s/%s status=failed reason=%s", chunk.number, len(chunks), result.failure_reason)
+            return
+
+        written_pairs = 0
+        duplicate_pairs = 0
+        for pair in result.qa_pairs:
+            if not args.disable_dedupe and is_duplicate_prompt(
+                pair["prompt"], seen_prompts, args.dedupe_threshold
+            ):
+                duplicate_pairs += 1
+                continue
+            f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+            seen_prompts.add(normalize_prompt(pair["prompt"]))
+            written_pairs += 1
+        f.flush()
+
+        stats.processed_chunks += 1
+        stats.successful_pairs += written_pairs
+        stats.duplicate_pairs += duplicate_pairs
+        chunk_state[chunk.chunk_id] = {
+            "status": "success",
+            "pairs_written": written_pairs,
+            "duplicates_skipped": duplicate_pairs,
+            "invalid_pairs": result.rejected,
+        }
+        save_resume_state(state_file, state)
+        logger.info(
+            "chunk=%s/%s status=success pairs_written=%s duplicates=%s invalid=%s next_delay=%.2fs",
+            chunk.number,
+            len(chunks),
+            written_pairs,
+            duplicate_pairs,
+            len(result.rejected),
+            rate_limit.current_delay(),
+        )
+
+    with output_file.open("a", encoding="utf-8") as f:
+        with ThreadPoolExecutor(max_workers=args.concurrent_ai_calls) as executor:
+            future_to_chunk = {}
+            for chunk in pending_chunks:
+                logger.info("chunk=%s/%s status=queued chars=%s", chunk.number, len(chunks), len(chunk.text))
+                future = executor.submit(
+                    process_chunk,
+                    model,
+                    chunk,
+                    args.max_retries,
+                    rate_limit,
+                    logger,
                 )
+                future_to_chunk[future] = chunk
 
-            if rate_limit.delay_seconds > 0:
-                time.sleep(rate_limit.delay_seconds)
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                try:
+                    record_result(future.result())
+                except Exception as exc:
+                    reason = f"chunk {chunk.number}: worker failed unexpectedly: {exc}"
+                    stats.failed_chunks.append(reason)
+                    chunk_state[chunk.chunk_id] = {"status": "failed", "reason": reason}
+                    save_resume_state(state_file, state)
+                    logger.exception("chunk=%s/%s status=failed reason=%s", chunk.number, len(chunks), reason)
 
     print("\nProgress summary")
     print("================")
