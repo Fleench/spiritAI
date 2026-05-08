@@ -10,7 +10,6 @@ Then train:
 from __future__ import annotations
 
 from contextlib import nullcontext
-import json
 import math
 import os
 from pathlib import Path
@@ -65,15 +64,11 @@ ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type 
 
 train_bin = DATA_DIR / "train.bin"
 val_bin = DATA_DIR / "val.bin"
-vocab_path = DATA_DIR / "vocab.json"
-if not train_bin.exists() or not val_bin.exists() or not vocab_path.exists():
-    raise FileNotFoundError(
-        f"Expected {train_bin}, {val_bin}, and {vocab_path}. Run prepare_data.py first."
-    )
+GPT2_VOCAB_SIZE = 50_257
+if not train_bin.exists() or not val_bin.exists():
+    raise FileNotFoundError(f"Expected {train_bin} and {val_bin}. Run prepare_data.py first.")
 
-with open(vocab_path, "r", encoding="utf-8") as f:
-    vocab_data = json.load(f)
-vocab_size = len(vocab_data["stoi"])
+vocab_size = GPT2_VOCAB_SIZE
 
 train_data = torch.from_file(str(train_bin), shared=False, size=train_bin.stat().st_size // 4, dtype=torch.int32)
 val_data = torch.from_file(str(val_bin), shared=False, size=val_bin.stat().st_size // 4, dtype=torch.int32)
@@ -83,7 +78,6 @@ if len(train_data) <= block_size or len(val_data) <= block_size:
 config = GPTConfig.from_env(vocab_size=vocab_size)
 config.block_size = block_size
 config.to_json(OUTPUT_DIR / "config.json")
-shutil.copyfile(vocab_path, OUTPUT_DIR / "vocab.json")
 
 def log(message: str) -> None:
     """Print immediately so unattended logs show progress in real time."""

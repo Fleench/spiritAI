@@ -1,4 +1,4 @@
-"""Sanitize theological text and tokenize it into train.bin/val.bin.
+"""Sanitize theological text and encode it into Nano-GPT train.bin/val.bin files.
 
 Usage:
     python prepare_data.py
@@ -10,29 +10,30 @@ them for tokenization.
 
 The output directory receives:
     clean.txt      deduplicated, normalized text
-    train.bin      uint32 token ids for training
-    val.bin        uint32 token ids for validation
-    vocab.json     regex word/punctuation vocabulary
+    train.bin      int32 tiktoken/gpt2 token ids for training
+    val.bin        int32 tiktoken/gpt2 token ids for validation
     meta.json      run metadata
+
+No custom vocabulary is generated. Training must use the standard tiktoken gpt2
+vocabulary size of 50,257.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import hashlib
 import json
 from pathlib import Path
 import re
 import unicodedata
 
-from array import array
+import numpy as np
+import tiktoken
 
 from paths import workspace_path
 
 DEFAULT_RAW_DATA_DIR = workspace_path("raw_data")
-
-TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+GPT2_VOCAB_SIZE = 50_257
 SPLIT_WORD_FIXES = {
     r"\bj\s+oined\b": "joined",
     r"\bjo\s+ined\b": "joined",
@@ -106,22 +107,6 @@ def deduplicate_paragraphs(text: str, min_chars: int = 40) -> tuple[str, int]:
     return "\n\n".join(kept), removed
 
 
-def build_vocab(tokens: list[str], min_freq: int) -> tuple[dict[str, int], dict[int, str]]:
-    counter = Counter(tokens)
-    vocab = ["<unk>"] + sorted(token for token, count in counter.items() if count >= min_freq)
-    stoi = {token: idx for idx, token in enumerate(vocab)}
-    itos = {idx: token for token, idx in stoi.items()}
-    return stoi, itos
-
-
-def encode(tokens: list[str], stoi: dict[str, int]) -> array:
-    unk = stoi["<unk>"]
-    ids = array("I", (stoi.get(token, unk) for token in tokens))
-    if ids.itemsize != 4:
-        raise RuntimeError("array('I') must be 4 bytes to write uint32 token bins")
-    return ids
-
-
 def resolve_input_paths(input_args: list[str] | None, output_dir: Path) -> list[Path]:
     """Resolve explicit input files or auto-detect cleaned corpus files."""
     if input_args:
@@ -175,8 +160,15 @@ def read_corpus(input_paths: list[Path]) -> str:
     return "".join(corpus_parts).strip()
 
 
+def encode_gpt2_int32(text: str) -> np.ndarray:
+    """Encode text with tiktoken's GPT-2 BPE and return disk-safe int32 ids."""
+    enc = tiktoken.get_encoding("gpt2")
+    ids = enc.encode(text)
+    return np.asarray(ids, dtype=np.int32)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare sanitized token bins for Nano-GPT training.")
+    parser = argparse.ArgumentParser(description="Prepare sanitized tiktoken/gpt2 token bins for Nano-GPT training.")
     parser.add_argument(
         "--input",
         nargs="*",
@@ -187,8 +179,10 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", default=workspace_path("data"))
     parser.add_argument("--val-fraction", type=float, default=0.1)
-    parser.add_argument("--min-freq", type=int, default=1, help="Minimum token frequency kept in vocab.")
     args = parser.parse_args()
+
+    if not 0.0 < args.val_fraction < 1.0:
+        raise ValueError("--val-fraction must be greater than 0 and less than 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -203,22 +197,16 @@ def main() -> None:
     clean_text, duplicates_removed = deduplicate_paragraphs(clean_text)
     (output_dir / "clean.txt").write_text(clean_text, encoding="utf-8")
 
-    tokens = TOKEN_RE.findall(clean_text)
-    if len(tokens) < 10_000:
-        raise ValueError(f"Only {len(tokens)} tokens found; expected a much larger training corpus.")
+    ids = encode_gpt2_int32(clean_text)
+    if len(ids) < 10_000:
+        raise ValueError(f"Only {len(ids)} tokens found; expected a much larger training corpus.")
 
-    stoi, itos = build_vocab(tokens, args.min_freq)
-    ids = encode(tokens, stoi)
     split_idx = int((1.0 - args.val_fraction) * len(ids))
-    train_ids = ids[:split_idx]
-    val_ids = ids[split_idx:]
-    with open(output_dir / "train.bin", "wb") as f:
-        train_ids.tofile(f)
-    with open(output_dir / "val.bin", "wb") as f:
-        val_ids.tofile(f)
+    train_ids = ids[:split_idx].astype(np.int32, copy=False)
+    val_ids = ids[split_idx:].astype(np.int32, copy=False)
+    train_ids.tofile(output_dir / "train.bin")
+    val_ids.tofile(output_dir / "val.bin")
 
-    with open(output_dir / "vocab.json", "w", encoding="utf-8") as f:
-        json.dump({"stoi": stoi, "itos": itos}, f, ensure_ascii=False)
     with open(output_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -229,15 +217,17 @@ def main() -> None:
                 "tokens": int(len(ids)),
                 "train_tokens": int(len(train_ids)),
                 "val_tokens": int(len(val_ids)),
-                "vocab_size": len(stoi),
-                "dtype": "uint32",
+                "encoding": "gpt2",
+                "vocab_size": GPT2_VOCAB_SIZE,
+                "dtype": "int32",
             },
             f,
             indent=2,
         )
 
     print(f"Wrote {len(train_ids):,} train tokens and {len(val_ids):,} val tokens to {output_dir}")
-    print(f"Vocabulary size: {len(stoi):,}; duplicate paragraphs removed: {duplicates_removed:,}")
+    print(f"Encoding: tiktoken/gpt2; vocab size: {GPT2_VOCAB_SIZE:,}; dtype: int32")
+    print(f"Duplicate paragraphs removed: {duplicates_removed:,}")
 
 
 if __name__ == "__main__":
