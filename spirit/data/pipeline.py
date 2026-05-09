@@ -9,12 +9,11 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from typing import Iterator
-
 import numpy as np
 import tiktoken
 
-from spirit.config import DATA_DIR, RAW_DATA_DIR, TRAIN_BIN_PATH, VAL_BIN_PATH
+from spirit.config import CUSTOM_HUGGINGFACE_RAW_DIR, RAW_DATA_DIR, TRAIN_BIN_PATH, VAL_BIN_PATH
+from spirit.data.custom_huggingface import load_huggingface_dataset_configs
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +72,24 @@ def load_raw_file(filename: str) -> list[str]:
     return text.split("\n\n")
 
 
-def prepare_dataset() -> None:
+def load_custom_huggingface_segments(config_path: str | None = None) -> list[str]:
+    """Load user-configured Hugging Face raw files, applying source weights."""
+    segments: list[str] = []
+    sources = load_huggingface_dataset_configs(config_path) if config_path else load_huggingface_dataset_configs()
+    for source in sources:
+        path = CUSTOM_HUGGINGFACE_RAW_DIR / source.output_file
+        if not path.exists():
+            logger.warning(f"Custom Hugging Face file {path} not found. Run download first. Skipping.")
+            continue
+
+        source_segments = deduplicate([sanitize_text(t) for t in path.read_text(encoding="utf-8").split("\n\n")])
+        for _ in range(source.weight):
+            segments.extend(source_segments)
+
+    return segments
+
+
+def prepare_dataset(config_path: str | None = None) -> None:
     """Sanitize, deduplicate, weight, and tokenize the datasets."""
     logger.info("Preparing dataset pipeline...")
 
@@ -84,6 +100,7 @@ def prepare_dataset() -> None:
     theo_turns = load_raw_file("theological_qa.txt")
     quora_turns = load_raw_file("quora_question_answer.txt")
     wiki_articles = load_raw_file("wikipedia.txt")
+    custom_huggingface_segments = load_custom_huggingface_segments(config_path)
 
     # Sanitize and deduplicate
     anf_segments = deduplicate([sanitize_text(t) for t in anf_segments])
@@ -105,6 +122,7 @@ def prepare_dataset() -> None:
     combined_segments.extend(alpaca_turns)
     combined_segments.extend(quora_turns)
     combined_segments.extend(wiki_articles)
+    combined_segments.extend(custom_huggingface_segments)
 
     for _ in range(3):
         combined_segments.extend(theo_turns)

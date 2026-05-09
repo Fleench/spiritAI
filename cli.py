@@ -10,6 +10,11 @@ import argparse
 import logging
 import sys
 
+from spirit.config import CHECKPOINT_PATH, TRAIN_BIN_PATH, VAL_BIN_PATH
+from spirit.data.pipeline import prepare_dataset
+from spirit.data.sources import fetch_all_sources
+from spirit.train.trainer import train
+
 # Configure logging for the application
 logging.basicConfig(
     level=logging.INFO,
@@ -17,17 +22,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-from spirit.config import CHECKPOINT_PATH, TRAIN_BIN_PATH, VAL_BIN_PATH, ModelConfig
-from spirit.data.pipeline import prepare_dataset
-from spirit.data.sources import fetch_all_sources
-from spirit.train.trainer import train
-
 logger = logging.getLogger("spirit.cli")
 
 
 def cmd_download(args: argparse.Namespace) -> None:
     """Download all required datasets."""
-    failures = fetch_all_sources()
+    failures = fetch_all_sources(args.hf_config)
     if failures:
         print("Could not download the following data sources:")
         for failure in failures:
@@ -36,7 +36,7 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 def cmd_prepare(args: argparse.Namespace) -> None:
     """Sanitize, deduplicate, and tokenize the datasets."""
-    prepare_dataset()
+    prepare_dataset(args.hf_config)
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -90,7 +90,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     # Data status
     train_size = os.path.getsize(TRAIN_BIN_PATH) / (1024*1024) if TRAIN_BIN_PATH.exists() else 0
     val_size = os.path.getsize(VAL_BIN_PATH) / (1024*1024) if VAL_BIN_PATH.exists() else 0
-    print(f"Data:")
+    print("Data:")
     print(f"  Train Set: {train_size:.2f} MB")
     print(f"  Val Set:   {val_size:.2f} MB")
 
@@ -120,10 +120,20 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Download
-    subparsers.add_parser("download", help="Fetch all datasets")
+    download_parser = subparsers.add_parser("download", help="Fetch all datasets")
+    download_parser.add_argument(
+        "--hf-config",
+        default=None,
+        help="Optional JSON file listing custom Hugging Face datasets",
+    )
 
     # Prepare
-    subparsers.add_parser("prepare", help="Sanitize and tokenize datasets")
+    prepare_parser = subparsers.add_parser("prepare", help="Sanitize and tokenize datasets")
+    prepare_parser.add_argument(
+        "--hf-config",
+        default=None,
+        help="Optional JSON file listing custom Hugging Face datasets",
+    )
 
     # Train
     subparsers.add_parser("train", help="Train or resume training")

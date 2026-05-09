@@ -1,0 +1,11 @@
+{
+  "datasets": [
+    {
+      "path": "vericudebuget/Bible-responses-dataset-gotquestions",
+      "split": "train",
+      "type": "auto",
+      "weight": 3,
+      "output_file": "bible_responses_gotquestions.txt"
+    }
+  ]
+}
