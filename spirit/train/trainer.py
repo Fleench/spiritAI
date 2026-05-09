@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 
 import numpy as np
@@ -18,8 +17,8 @@ from dotenv import load_dotenv
 # Ensure dotenv is loaded before reading env vars
 load_dotenv()
 
-from spirit.config import CHECKPOINT_PATH, TRAIN_BIN_PATH, VAL_BIN_PATH, ModelConfig, TrainConfig
-from spirit.model import GPT
+from spirit.config import CHECKPOINT_PATH, TRAIN_BIN_PATH, VAL_BIN_PATH, ModelConfig, TrainConfig  # noqa: E402
+from spirit.model import GPT  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +86,38 @@ def get_lr(it: int, config: TrainConfig) -> float:
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
 
+def _model_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Return the underlying model state dict, handling torch.compile wrappers."""
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod.state_dict()
+    return model.state_dict()
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    model_config: ModelConfig,
+    iter_num: int,
+    best_val_loss: float,
+) -> None:
+    """Persist model and optimizer state so training can be resumed later."""
+    logger.info(f"Saving checkpoint to {CHECKPOINT_PATH}")
+    checkpoint = {
+        'model': _model_state_dict(model),
+        'optimizer': optimizer.state_dict(),
+        'model_args': {
+            'block_size': model_config.block_size,
+            'vocab_size': model_config.vocab_size,
+            'n_layer': model_config.n_layer,
+            'n_head': model_config.n_head,
+            'n_embd': model_config.n_embd,
+        },
+        'iter_num': iter_num,
+        'best_val_loss': best_val_loss,
+    }
+    torch.save(checkpoint, CHECKPOINT_PATH)
+
+
 def train() -> None:
     """Execute the full training loop."""
     logger.info("Initializing training run...")
@@ -149,64 +180,55 @@ def train() -> None:
     t0 = time.time()
 
     logger.info("Starting training...")
-    while iter_num <= train_config.max_iters:
-        # Determine current learning rate
-        lr = get_lr(iter_num, train_config) if train_config.decay_lr else train_config.learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    try:
+        while iter_num <= train_config.max_iters:
+            # Determine current learning rate
+            lr = get_lr(iter_num, train_config) if train_config.decay_lr else train_config.learning_rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        # Evaluation and checkpointing
-        if iter_num % train_config.eval_interval == 0 and iter_num > 0:
-            losses = estimate_loss(
-                model, train_data, val_data, train_config.eval_iters,
-                train_config.batch_size, model_config.block_size, device
-            )
-            logger.info(f"step {iter_num}: train loss {losses.get('train', 0.0):.4f}, val loss {losses.get('val', 0.0):.4f}")
+            # Evaluation and checkpointing
+            if iter_num % train_config.eval_interval == 0 and iter_num > 0:
+                losses = estimate_loss(
+                    model, train_data, val_data, train_config.eval_iters,
+                    train_config.batch_size, model_config.block_size, device
+                )
+                logger.info(f"step {iter_num}: train loss {losses.get('train', 0.0):.4f}, val loss {losses.get('val', 0.0):.4f}")
 
-            if losses.get('val', 0.0) < best_val_loss or train_config.always_save_checkpoint:
-                best_val_loss = losses.get('val', best_val_loss)
-                logger.info(f"Saving checkpoint to {CHECKPOINT_PATH}")
-                checkpoint = {
-                    'model': model.state_dict() if not hasattr(model, '_orig_mod') else model._orig_mod.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': {
-                        'block_size': model_config.block_size,
-                        'vocab_size': model_config.vocab_size,
-                        'n_layer': model_config.n_layer,
-                        'n_head': model_config.n_head,
-                        'n_embd': model_config.n_embd,
-                    },
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                }
-                torch.save(checkpoint, CHECKPOINT_PATH)
+                if losses.get('val', 0.0) < best_val_loss or train_config.always_save_checkpoint:
+                    best_val_loss = losses.get('val', best_val_loss)
+                    save_checkpoint(model, optimizer, model_config, iter_num, best_val_loss)
 
-        # Forward and backward pass with gradient accumulation
-        for micro_step in range(train_config.grad_accum_steps):
-            logits, loss = model(X, Y)
-            # scale the loss to account for gradient accumulation
-            loss = loss / train_config.grad_accum_steps
+            # Forward and backward pass with gradient accumulation
+            for micro_step in range(train_config.grad_accum_steps):
+                logits, loss = model(X, Y)
+                # scale the loss to account for gradient accumulation
+                loss = loss / train_config.grad_accum_steps
 
-            # backward pass
-            loss.backward()
+                # backward pass
+                loss.backward()
 
-            # fetch next batch
-            X, Y = get_batch(train_data, train_config.batch_size, model_config.block_size, device)
+                # fetch next batch
+                X, Y = get_batch(train_data, train_config.batch_size, model_config.block_size, device)
 
-        # Clip gradients
-        if train_config.grad_clip != 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+            # Clip gradients
+            if train_config.grad_clip != 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
 
-        # Optimizer step
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            # Optimizer step
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        # Logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % train_config.log_interval == 0:
-            lossf = loss.item() * train_config.grad_accum_steps # scale back up for logging
-            logger.info(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.4e}")
+            # Logging
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+            if iter_num % train_config.log_interval == 0:
+                lossf = loss.item() * train_config.grad_accum_steps # scale back up for logging
+                logger.info(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.4e}")
 
-        iter_num += 1
+            iter_num += 1
+    except KeyboardInterrupt:
+        logger.warning("Keyboard interrupt received; saving checkpoint before exiting.")
+        save_checkpoint(model, optimizer, model_config, iter_num, best_val_loss)
+        logger.info("Checkpoint saved. Training stopped by user.")
