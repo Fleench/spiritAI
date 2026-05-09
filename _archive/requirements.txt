@@ -1,0 +1,13 @@
+# Core training and inference dependencies
+torch>=2.2
+python-dotenv>=1.0
+google-generativeai>=0.8
+google-api-core>=2.0
+
+# Corpus download/preparation utilities
+requests>=2.31
+numpy>=1.26
+tiktoken>=0.7
+
+# Optional helper used by tmp.py for web scraping experiments
+playwright>=1.40
