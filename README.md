@@ -50,8 +50,36 @@ The project uses a unified CLI for all operations.
    ```bash
    python cli.py download
    ```
+
+   You can add arbitrary Hugging Face datasets in `spirit/data/huggingface_datasets.json` without changing code. The downloader auto-detects common Q&A/instruction schemas (for example `question`/`answer`, `prompt`/`response`, or `instruction`/`output`) and falls back to plain text columns when possible. Set `type` to `qa` or `text` when you want to override auto-detection, and use explicit column lists if a dataset has unusual names:
+   ```json
+   {
+     "datasets": [
+       {
+         "path": "vericudebuget/Bible-responses-dataset-gotquestions",
+         "split": "train",
+         "type": "auto",
+         "weight": 3,
+         "output_file": "bible_responses_gotquestions.txt"
+       },
+       {
+         "path": "owner/plain-text-corpus",
+         "type": "text",
+         "text_columns": ["body"],
+         "max_rows": 50000
+       },
+       {
+         "path": "owner/custom-qa-corpus",
+         "type": "qa",
+         "prompt_columns": ["question"],
+         "response_columns": ["accepted_answer"]
+       }
+     ]
+   }
+   ```
+   Custom downloads are written under `data/raw/huggingface/` and are included by `prepare`. To use a different config file for one run, pass `--hf-config path/to/file.json` to both `download` and `prepare`.
 2. **Prepare Data:**
-   Sanitizes text, applies weighting (e.g. Theological Q&A 3x), deduplicates, tokenizes, and saves to `.bin` format.
+   Sanitizes text, applies weighting (e.g. Theological Q&A 3x and custom Hugging Face `weight` values), deduplicates, tokenizes, and saves to `.bin` format.
    ```bash
    python cli.py prepare
    ```

@@ -28,6 +28,9 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # Dataset paths
 RAW_DATA_DIR = DATA_DIR / "raw"
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+CUSTOM_HUGGINGFACE_RAW_DIR = RAW_DATA_DIR / "huggingface"
+CUSTOM_HUGGINGFACE_RAW_DIR.mkdir(parents=True, exist_ok=True)
+HUGGINGFACE_DATASETS_CONFIG_PATH = ROOT_DIR / "spirit" / "data" / "huggingface_datasets.json"
 TRAIN_BIN_PATH = DATA_DIR / "train.bin"
 VAL_BIN_PATH = DATA_DIR / "val.bin"
 

@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
-from typing import TypeVar
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+from typing import Any, TypeVar
 
 import requests
 from datasets import load_dataset # type: ignore
 
-from spirit.config import RAW_DATA_DIR, ROOT_DIR
+from spirit.config import CUSTOM_HUGGINGFACE_RAW_DIR, RAW_DATA_DIR, ROOT_DIR
+from spirit.data.custom_huggingface import HuggingFaceDatasetConfig, load_huggingface_dataset_configs
 from spirit.data.format import format_chat_turn
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,10 @@ logger = logging.getLogger(__name__)
 WIKI_KEYWORDS = {"religion", "philosophy", "christianity", "theology", "god", "church", "bible"}
 
 T = TypeVar("T")
+
+QA_PROMPT_CANDIDATES = ("question", "prompt", "instruction", "query", "user", "input", "title")
+QA_RESPONSE_CANDIDATES = ("answer", "response", "output", "completion", "assistant", "text")
+TEXT_CANDIDATES = ("text", "content", "article", "body", "passage", "answer", "response", "output")
 
 
 def _format_failure(source_name: str, exc: Exception) -> str:
@@ -57,6 +63,12 @@ def _write_text(filename: str, text: str) -> None:
 def _write_turns(filename: str, turns: list[str]) -> None:
     """Write formatted chat turns to the raw data directory."""
     _write_text(filename, "\n\n".join(turns))
+
+
+def _write_path(path: Path, text: str) -> None:
+    """Write text to an explicit path, creating parent directories as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def download_ante_nicene_fathers() -> str:
@@ -149,6 +161,134 @@ def download_quora_question_answer() -> list[str]:
     return turns
 
 
+def _first_present_text(row: Mapping[str, Any], columns: Iterable[str]) -> str:
+    """Return the first non-empty string from the requested row columns."""
+    for column in columns:
+        if column in row and row[column] is not None:
+            text = str(row[column]).strip()
+            if text:
+                return text
+    return ""
+
+
+def _combine_present_text(row: Mapping[str, Any], columns: Iterable[str]) -> str:
+    """Join all non-empty strings from the requested row columns."""
+    parts = []
+    for column in columns:
+        if column in row and row[column] is not None:
+            text = str(row[column]).strip()
+            if text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _detect_qa_columns(row: Mapping[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Infer prompt/response columns from common instruction and Q&A schemas."""
+    keys = {key.lower(): key for key in row.keys()}
+
+    prompt_columns = [keys[name] for name in QA_PROMPT_CANDIDATES if name in keys]
+    response_columns = [keys[name] for name in QA_RESPONSE_CANDIDATES if name in keys]
+
+    # Alpaca-style rows often use instruction + optional input as the prompt.
+    if "instruction" in keys and "input" in keys:
+        prompt_columns = [keys["instruction"], keys["input"]]
+
+    if prompt_columns and response_columns:
+        # Do not use the same column as both sides of a chat turn.
+        prompt_tuple = tuple(prompt_columns)
+        response_tuple = tuple(col for col in response_columns if col not in prompt_tuple)
+        if response_tuple:
+            return prompt_tuple, response_tuple
+
+    return None
+
+
+def _detect_text_columns(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Infer plain-text columns from common corpus schemas."""
+    keys = {key.lower(): key for key in row.keys()}
+    for candidate in TEXT_CANDIDATES:
+        if candidate in keys and str(row[keys[candidate]]).strip():
+            return (keys[candidate],)
+
+    string_columns = [key for key, value in row.items() if isinstance(value, str) and value.strip()]
+    return tuple(string_columns[:1])
+
+
+def _format_custom_huggingface_row(
+    row: Mapping[str, Any],
+    source: HuggingFaceDatasetConfig,
+) -> str:
+    """Format one arbitrary Hugging Face row as chat or plain text."""
+    prompt_columns = source.prompt_columns
+    response_columns = source.response_columns
+    text_columns = source.text_columns
+    data_type = source.data_type
+
+    if data_type in {"auto", "qa"}:
+        if not prompt_columns or not response_columns:
+            detected = _detect_qa_columns(row)
+            if detected:
+                prompt_columns = prompt_columns or detected[0]
+                response_columns = response_columns or detected[1]
+
+        if prompt_columns and response_columns:
+            prompt = _combine_present_text(row, prompt_columns)
+            response = _first_present_text(row, response_columns)
+            if prompt and response:
+                return format_chat_turn(prompt, response)
+
+        if data_type == "qa":
+            return ""
+
+    if not text_columns:
+        text_columns = _detect_text_columns(row)
+
+    return _combine_present_text(row, text_columns)
+
+
+def download_custom_huggingface_dataset(source: HuggingFaceDatasetConfig) -> list[str]:
+    """Download and format a configured Hugging Face dataset."""
+    logger.info("Downloading custom Hugging Face dataset %s...", source.path)
+    load_kwargs: dict[str, Any] = {"split": source.split}
+    if source.config:
+        load_kwargs["name"] = source.config
+    if source.streaming:
+        load_kwargs["streaming"] = True
+
+    dataset = load_dataset(source.path, **load_kwargs)
+    rows = []
+    for index, row in enumerate(dataset):
+        if source.max_rows is not None and index >= source.max_rows:
+            break
+        if not isinstance(row, Mapping):
+            continue
+        formatted = _format_custom_huggingface_row(row, source)
+        if formatted:
+            rows.append(formatted)
+
+    return rows
+
+
+def fetch_custom_huggingface_sources(config_path: str | Path | None = None) -> list[str]:
+    """Fetch user-configured Hugging Face datasets and save them as raw text."""
+    failures: list[str] = []
+    sources = load_huggingface_dataset_configs(config_path) if config_path else load_huggingface_dataset_configs()
+    if not sources:
+        logger.info("No custom Hugging Face datasets configured.")
+        return failures
+
+    for source in sources:
+        _fetch_and_save(
+            source.path,
+            lambda source=source: download_custom_huggingface_dataset(source),
+            lambda rows, source=source: _write_path(
+                CUSTOM_HUGGINGFACE_RAW_DIR / source.output_file, "\n\n".join(rows)
+            ),
+            failures,
+        )
+
+    return failures
+
 def download_wikipedia() -> list[str]:
     """Download and filter wikimedia/wikipedia dataset."""
     logger.info("Downloading wikimedia/wikipedia (this may take a while)...")
@@ -170,7 +310,7 @@ def download_wikipedia() -> list[str]:
     return articles
 
 
-def fetch_all_sources() -> list[str]:
+def fetch_all_sources(config_path: str | Path | None = None) -> list[str]:
     """Fetch all configured data sources and save them to the raw data directory.
 
     Returns:
@@ -215,6 +355,8 @@ def fetch_all_sources() -> list[str]:
         lambda articles: _write_text("wikipedia.txt", "\n\n".join(articles)),
         failures,
     )
+
+    failures.extend(fetch_custom_huggingface_sources(config_path))
 
     if failures:
         logger.warning("Could not download: %s", "; ".join(failures))
