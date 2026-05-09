@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from collections.abc import Callable
+from typing import TypeVar
 
 import requests
 from datasets import load_dataset # type: ignore
@@ -20,6 +21,42 @@ logger = logging.getLogger(__name__)
 
 # Target topics for Wikipedia filtering
 WIKI_KEYWORDS = {"religion", "philosophy", "christianity", "theology", "god", "church", "bible"}
+
+T = TypeVar("T")
+
+
+def _format_failure(source_name: str, exc: Exception) -> str:
+    """Return a concise, user-facing download failure message."""
+    message = str(exc).strip()
+    if message:
+        return f"{source_name} ({message})"
+    return source_name
+
+
+def _fetch_and_save(
+    source_name: str,
+    download_fn: Callable[[], T],
+    save_fn: Callable[[T], None],
+    failures: list[str],
+) -> None:
+    """Fetch one source and record failures without stopping the download run."""
+    try:
+        data = download_fn()
+        save_fn(data)
+    except Exception as exc:
+        failures.append(_format_failure(source_name, exc))
+        logger.debug("Could not download %s", source_name, exc_info=True)
+
+
+def _write_text(filename: str, text: str) -> None:
+    """Write raw text to the raw data directory."""
+    with open(RAW_DATA_DIR / filename, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _write_turns(filename: str, turns: list[str]) -> None:
+    """Write formatted chat turns to the raw data directory."""
+    _write_text(filename, "\n\n".join(turns))
 
 
 def download_ante_nicene_fathers() -> str:
@@ -97,6 +134,21 @@ def download_theological_qa() -> list[str]:
     return turns
 
 
+def download_quora_question_answer() -> list[str]:
+    """Download and format toughdata/quora-question-answer-dataset JSON rows."""
+    logger.info("Downloading toughdata/quora-question-answer-dataset...")
+    dataset = load_dataset("toughdata/quora-question-answer-dataset", split="train")
+
+    turns = []
+    for row in dataset:
+        question = str(row["question"]).strip() # type: ignore
+        answer = str(row["answer"]).strip() # type: ignore
+        if question and answer:
+            turns.append(format_chat_turn(question, answer))
+
+    return turns
+
+
 def download_wikipedia() -> list[str]:
     """Download and filter wikimedia/wikipedia dataset."""
     logger.info("Downloading wikimedia/wikipedia (this may take a while)...")
@@ -118,33 +170,55 @@ def download_wikipedia() -> list[str]:
     return articles
 
 
-def fetch_all_sources() -> None:
-    """Fetch all configured data sources and save them to the raw data directory."""
+def fetch_all_sources() -> list[str]:
+    """Fetch all configured data sources and save them to the raw data directory.
+
+    Returns:
+        A list of user-facing names for sources that could not be downloaded.
+    """
     logger.info("Starting data source downloads...")
+    failures: list[str] = []
 
-    # 1. Ante-Nicene Fathers
-    anf_text = download_ante_nicene_fathers()
-    with open(RAW_DATA_DIR / "ante_nicene_fathers.txt", "w", encoding="utf-8") as f:
-        f.write(anf_text)
+    _fetch_and_save(
+        "Ante-Nicene Fathers",
+        download_ante_nicene_fathers,
+        lambda text: _write_text("ante_nicene_fathers.txt", text),
+        failures,
+    )
+    _fetch_and_save(
+        "CPDV Bible",
+        load_cpdv_bible,
+        lambda text: _write_text("bible.txt", text),
+        failures,
+    )
+    _fetch_and_save(
+        "yahma/alpaca-cleaned",
+        download_alpaca,
+        lambda turns: _write_turns("alpaca.txt", turns),
+        failures,
+    )
+    _fetch_and_save(
+        "Malalatiana/theological-questions-answers",
+        download_theological_qa,
+        lambda turns: _write_turns("theological_qa.txt", turns),
+        failures,
+    )
+    _fetch_and_save(
+        "toughdata/quora-question-answer-dataset",
+        download_quora_question_answer,
+        lambda turns: _write_turns("quora_question_answer.txt", turns),
+        failures,
+    )
+    _fetch_and_save(
+        "wikimedia/wikipedia",
+        download_wikipedia,
+        lambda articles: _write_text("wikipedia.txt", "\n\n".join(articles)),
+        failures,
+    )
 
-    # 2. Bible
-    bible_text = load_cpdv_bible()
-    with open(RAW_DATA_DIR / "bible.txt", "w", encoding="utf-8") as f:
-        f.write(bible_text)
+    if failures:
+        logger.warning("Could not download: %s", "; ".join(failures))
+    else:
+        logger.info("Finished downloading all data sources.")
 
-    # 3. Alpaca Cleaned
-    alpaca_turns = download_alpaca()
-    with open(RAW_DATA_DIR / "alpaca.txt", "w", encoding="utf-8") as f:
-        f.write("\n\n".join(alpaca_turns))
-
-    # 4. Theological Q&A
-    theo_turns = download_theological_qa()
-    with open(RAW_DATA_DIR / "theological_qa.txt", "w", encoding="utf-8") as f:
-        f.write("\n\n".join(theo_turns))
-
-    # 5. Filtered Wikipedia
-    wiki_articles = download_wikipedia()
-    with open(RAW_DATA_DIR / "wikipedia.txt", "w", encoding="utf-8") as f:
-        f.write("\n\n".join(wiki_articles))
-
-    logger.info("Finished downloading all data sources.")
+    return failures

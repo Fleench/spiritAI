@@ -82,6 +82,7 @@ def prepare_dataset() -> None:
     bible_segments = load_raw_file("bible.txt")
     alpaca_turns = load_raw_file("alpaca.txt")
     theo_turns = load_raw_file("theological_qa.txt")
+    quora_turns = load_raw_file("quora_question_answer.txt")
     wiki_articles = load_raw_file("wikipedia.txt")
 
     # Sanitize and deduplicate
@@ -89,11 +90,12 @@ def prepare_dataset() -> None:
     bible_segments = deduplicate([sanitize_text(t) for t in bible_segments])
     alpaca_turns = deduplicate([sanitize_text(t) for t in alpaca_turns])
     theo_turns = deduplicate([sanitize_text(t) for t in theo_turns])
+    quora_turns = deduplicate([sanitize_text(t) for t in quora_turns])
     wiki_articles = deduplicate([sanitize_text(t) for t in wiki_articles])
 
     # Weight mixing
     # Theological Q&A repeated 3x
-    # HuggingFace (Alpaca) 1x
+    # HuggingFace chat datasets (Alpaca, Quora) 1x
     # Wikipedia filtered and capped (already handled in source, 1x here)
     # Background theological texts (ANF, Bible) 1x
     combined_segments = []
@@ -101,6 +103,7 @@ def prepare_dataset() -> None:
     combined_segments.extend(anf_segments)
     combined_segments.extend(bible_segments)
     combined_segments.extend(alpaca_turns)
+    combined_segments.extend(quora_turns)
     combined_segments.extend(wiki_articles)
 
     for _ in range(3):

@@ -27,7 +27,11 @@ logger = logging.getLogger("spirit.cli")
 
 def cmd_download(args: argparse.Namespace) -> None:
     """Download all required datasets."""
-    fetch_all_sources()
+    failures = fetch_all_sources()
+    if failures:
+        print("Could not download the following data sources:")
+        for failure in failures:
+            print(f"- {failure}")
 
 
 def cmd_prepare(args: argparse.Namespace) -> None:
